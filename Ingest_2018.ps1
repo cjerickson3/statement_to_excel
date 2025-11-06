@@ -11,7 +11,7 @@ $script    = Join-Path $root "statement_to_excel.py"
 $inDir     = Join-Path $root "History_text"
 $pdfDir    = Join-Path $root "Chase_history"
 $dashboard = Join-Path $root "Chase_Budget_Dashboard.xlsx"
-$rules     = Join-Path $root "category_rules.csv"   # optional
+$rules     = Join-Path $root "category_rules_standardized.csv"   # optional
 $yearPrefix = "2018"
 
 # --- Guard checks ---
@@ -76,7 +76,7 @@ foreach ($f in $files) {
     $script,
     '--input',     $inPath,
     '--dashboard', $dashboard,
-    '--auto-adjust',
+    '--auto-adjust', '--debug',
     '--audit'
   ) + $rulesArg
 

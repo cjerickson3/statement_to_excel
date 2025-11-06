@@ -1,0 +1,45 @@
+*** a/statement_to_excel.py
+--- b/statement_to_excel.py
+@@
+-    # Savings detection (too broad — causes false positives on "Transfer From Savings")
+-    SAVINGS_BANNER   = re.compile(r'\bCHASE\s+SAVINGS\b|\bSAVINGS\s+SUMMARY\b|\bSAVINGS\b', re.I)
++    # Savings detection — anchor to real headers only (prevents hits on "Transfer From Savings ...")
++    SAVINGS_BANNER   = re.compile(r'^\s*(?:CHASE\s+SAVINGS|SAVINGS\s+SUMMARY)\s*$', re.I)
++    # Savings table header to detect actual detail start
++    SAVINGS_TABLEHDR = re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', re.I)
+@@
+-    end_idx = len(lines)
+-    in_savings = False
++    end_idx = len(lines)
++    in_savings = False
+@@
+-        elif SAVINGS_BANNER.search(line):
+-            last_savings_banner = i
+-            if debug:
+-                print(f"[clip2] SAVINGS banner at line {i+1}: {line!r}")
+-            continue
++        elif SAVINGS_BANNER.search(line):
++            in_savings = True
++            if debug:
++                print(f"[clip2] Entered SAVINGS banner at line {i+1}: {line!r}")
++            continue
+@@
+-        if in_savings:
+-            # If we see any transaction header or a date-led row while in Savings,
+-            # that means Savings detail is starting → truncate here.
+-            if any(p.search(line) for p in TXN_HEADERS) or DATE_HEAD.match(line):
+-                end_idx = i
+-                if debug: print(f"[clip2] Truncating before Savings details at line {i+1}: {line!r}")
+-                break
++        if in_savings:
++            # Truncate only when Savings DETAIL actually starts
++            if any(p.search(line) for p in TXN_HEADERS) or SAVINGS_TABLEHDR.search(line):
++                end_idx = i
++                if debug: print(f"[clip2] Truncating before Savings details at line {i+1}: {line!r}")
++                break
+@@
+-    # Always run the text-only guard after pdf-band
+-    lines = clip_to_checking_lines(lines, debug=args.debug)
++    # Only run the text-only guard if we don't already have a good band
++    if not args.pdf or not lines:
++        lines = clip_to_checking_lines(lines, debug=args.debug)

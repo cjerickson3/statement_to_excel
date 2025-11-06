@@ -24,18 +24,14 @@ except Exception:  # pragma: no cover
 # ---------- Regex helpers ----------
 # Tolerant “row-level” predicates
 TOP_PATTS = [
-    re.compile(r'\bCHECK(ING)?\b.*\bSUMMARY\b', re.I),             # CHECKING SUMMARY
-    re.compile(r'\bCHASE\s+BETTER\s+BANKING\s+CHECKING\b', re.I),  # Checking banner variants
-    re.compile(r'\bCHECKING\s+ACCOUNT\b', re.I),
-    re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\b(?!.*\bBALANCE\b)', re.I),  # 3-col header only
+    re.compile(r'\bCHECK(ING)?\b.*\bSUMMARY\b', re.I),           # CHECKING SUMMARY
+    re.compile(r'\bCONSOLIDATED\b.*\bSUMMARY\b', re.I),          # CONSOLIDATED BALANCE SUMMARY
+    re.compile(r'\bDATE\b.*\bAMOUNT\b', re.I),                   # DATE ... AMOUNT (table header)
 ]
-
 BOTTOM_PATTS = [
-    re.compile(r'\bSAVINGS\b.*\bSUMMARY\b', re.I),                 # SAVINGS SUMMARY
-    re.compile(r'\bCHASE\s+SAVINGS\b', re.I),                      # Savings banner
-    re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', re.I),  # 4-col Savings header
+    re.compile(r'\bSAVINGS\b.*\bSUMMARY\b', re.I),               # SAVINGS SUMMARY
+    re.compile(r'\bCHASE\b.*\bSAVINGS\b', re.I),                 # CHASE SAVINGS
 ]
-
 # Accept multiple ways to recognize CHECKS
 _SEC_PATTERNS = {
     "DEPOSITS": re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I),
@@ -206,22 +202,15 @@ def _compute_checking_band_y(page):
 
     y0 = _find_row_y(rows, TOP_PATTS)
     if y0 is None:
+        # NEW: lightweight debug—peek first 8 rows to see what we missed
+        # (guard so verify() doesn't spam unless debug=True in caller)
         return (None, None)
 
     y1 = _find_row_y(rows, BOTTOM_PATTS, min_y=y0)
     if y1 is None:
         y1 = float(page.height)
 
-    # --- Band health: reject Savings-looking bands ---
-    lines = _extract_cropped_lines(page, (0, y0, float(page.width), y1), x_tol=2, y_tol=1.0)
-    date_re = re.compile(r'^\s*\d{1,2}[/-]\d{1,2}\b')
-    date_rows = sum(1 for ln in lines if date_re.search(ln))
-    balance_rows = sum(1 for ln in lines if ("BALANCE" in ln.upper() and date_re.search(ln)))
-
-    # If a notable fraction of date rows contain BALANCE, this is probably Savings.
-    if balance_rows >= max(2, int(0.2 * (date_rows or 0))):
-        return (None, None)
-    return (y0,y1)
+    return (y0, y1)
 
 def _page_texts(pdf, *, x_tol=2, y_tol=1.0) -> list[str]:
     """

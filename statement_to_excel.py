@@ -16,6 +16,7 @@ import sys
 import subprocess
 import argparse
 from pathlib import Path
+import unicodedata
 import shutil
 import pandas as pd
 import xlsxwriter
@@ -125,11 +126,16 @@ NEXT_SEC = re.compile(
     re.I
 )
 MAJOR_STOP = re.compile(
-    r"^(?:\s*)(?:CHECKING\s+SUMMARY|CHECK\s+NO\.\s+DESCRIPTION|"
-    r"CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"
-    r"ELECTRONIC\s+WITHDRAWALS?)\b(?!.*\d[\d,]*\.\d{2})",
+    r"^(?:\s*)(?:"
+    r"CHECKS?\s+PAID|"                              # checks section header
+    r"ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"      # ATM/DEBIT section
+    r"ELECTRONIC\s+WITHDRAWALS?|"                   # Electronic section
+    r"DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)|"        # Deposits section
+    r"CHECKING\s+SUMMARY"                           # summary banner
+    r")\b",
     re.I
 )
+
 ATM_DEBIT_HDR = re.compile(r'ATM\s*&?\s*Debit\s*Card\s*Withdrawals?', re.I)
 ELEC_WITH_HDR = re.compile(r'Electronic\s+Withdrawals?', re.I)
 # New Balance code
@@ -168,8 +174,50 @@ ACCT_LINE_RE = re.compile(
     r"Checking\s+000000714245263\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})",
     re.I
 )
+
+# --- Text-only truncation after the "post fees" message block ---
+
+POST_FEES_START = re.compile(r'^\*start\*\s*post\s+fees\s+message\b', re.I)
+POST_FEES_END   = re.compile(r'^\*end\*\s*post\s+fees\s+message\b',   re.I)
+
+def clip_after_post_fees_block(lines: list[str], *, debug: bool=False) -> list[str]:
+    """
+    Find the first '*start*post fees message' ... '*end*post fees message' block,
+    and truncate the text right AFTER that block (i.e., drop everything that follows).
+    If the pair isn't found, returns the original lines unchanged.
+    """
+    n = len(lines)
+    start_i = end_i = None
+
+    for i in range(n):
+        s = (lines[i] or "").strip()
+        if start_i is None:
+            if POST_FEES_START.match(s):
+                start_i = i
+        else:
+            if POST_FEES_END.match(s):
+                end_i = i
+                break
+
+    if start_i is not None and end_i is not None and end_i >= start_i:
+        if debug:
+            print(f"[clip-postfees] found block: start={start_i+1}, end={end_i+1}  → truncating after end")
+        # Keep everything up to and including the end marker, drop the rest
+        return lines[: end_i + 1]
+
+    if debug:
+        why = "no start marker" if start_i is None else "no end marker after start"
+        print(f"[clip-postfees] no truncation ({why})")
+    return lines
+
 date_re        = re.compile(r'^\s*(\d{2}/\d{2})\b')
 amount_only_re = re.compile(r'^\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})\s*$')
+NONBREAKING_SPACES = ("\u00A0", "\u2007", "\u202F")
+def _clean_for_match(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    for ch in NONBREAKING_SPACES:
+        s = s.replace(ch, " ")
+    return s
 
 # Fallback: “... 000000714245263 $2,315.05 $3,244.86” -> last two amounts on the line
 # (first = beginning, second = ending)
@@ -183,7 +231,7 @@ def _to_float_amt(txt: str) -> float:
         neg, s = True, s[1:-1]
     val = float(s)
     return -val if neg else val
-def parse_begin_end_balances(lines: list[str]) -> tuple[float|None, float|None]:
+def parse_begin_end_balances(lines: list[str], *, debug: bool = False) -> tuple[float | None, float | None]:
     """
     Returns (begin, end) balances for the CHECKING account on the statement.
     Priority:
@@ -192,17 +240,19 @@ def parse_begin_end_balances(lines: list[str]) -> tuple[float|None, float|None]:
       3) Labeled 'Beginning Balance …' / 'Ending (or Closing) Balance …'
       4) None, None
     """
-    # 1) Exact literal Checking header you provided
+    # 1) Exact literal Checking header you provided...
     for raw in lines:
-        m = CHECKING_SPECIFIC_RE.search(raw)
+        line = _clean_for_match(raw)
+        m = CHECKING_SPECIFIC_RE.search(line)
         if m:
             try:
                 b = _to_float_amt(m.group("begin"))
                 e = _to_float_amt(m.group("end"))
+                if debug:
+                    print(f"[balances:checking-header] {line.strip()} -> begin={b} end={e}")
                 return b, e
             except Exception:
-                pass  # keep looking if parse fails
-
+                pass # keep looking if parse fails
     # 2) Generic "Checking <acct> $begin $end" (ignores Savings entirely)
     for raw in lines:
         m = CHECKING_GENERIC_RE.search(raw)
@@ -470,6 +520,8 @@ def categorize_default(description: str) -> str:
     if "GOLF" in u: return "Golf"
     if "WELLCARE" in u or "CHIROPRACT" in u: return "Health & wellness"
     if "KERA" in u: return "Donations"
+    if any(x in u for x in ["City of Plano","Solar","ATMOS"]): return "Utility"
+    if any(x in u for x in ["Allstate","Northwestern Mutual Isa","Unitedhealthone Ins"]): return "Insurance"
     if any(x in u for x in ["KROGER","TRADER JOE","TOM THUMB","CENTRAL MARKET","MARKET STREET","WHOLEFDS","GROC"]): return "Groceries"
     if any(x in u for x in ["QUIKTRIP","SHELL","EXXON","FUEL","GAS"]): return "Gas"
     if any(x in u for x in ["J. JILL","DSW","KOHL","MARSHALLS","REI","ANTHROPOLOGIE","BEDBATH"]): return "Shopping"
@@ -510,48 +562,75 @@ def apply_rules(description: str, rules):
             continue
     return None
 
+def _norm_marker(name: str) -> str:
+    s = (name or "").lower().strip()
+    s = re.sub(r"\s*section\d+\b", "", s)
+    s = s.replace("\u00A0"," ").replace("\u2007"," ").replace("\u202F"," ")
+    s = re.sub(r"[&\-\s]+", "", s)
+    s = re.sub(r"withdrawals\b", "withdrawal", s)
+    return s
+
 def parse_by_startend_markers(lines: list[str], *, debug=False) -> list[str]:
-    """
-    Use '*start*...'' and '*end*...' pdftotext markers to isolate Checking-band text,
-    replacing the pdfplumber band logic. Returns the subset of lines covering the
-    sections that belong to the CHECKING account only.
-    """
-    marker_re = re.compile(r"^\*+(start|end)\*+(.+)$", re.I)
-    sections, current = [], None
+    marker_re = re.compile(r"^\*+(?:start|end)\*+(.+)$", re.I)
 
-    for i, raw in enumerate(lines):
-        m = marker_re.match(raw.strip())
-        if not m:
+    # 1) Which sections appear anywhere on these pages?
+    want_present = set()
+    for raw in lines:
+        m = marker_re.match((raw or "").strip())
+        if m:
+            want_present.add(_norm_marker(m.group(1)))
+
+    WANT = {
+        "depositsandadditions",
+        "checkspaid",
+        "atmdebitwithdrawal",
+        "electronicwithdrawal",
+    }
+    want_present &= WANT  # limit to the sections we care about
+
+    if not want_present:
+        if debug: print("[markers] none of our target sections present; fail-open")
+        return lines
+
+    # 2) Slice by real headers (continuations included) and keep wanted ones
+    HDRS = [
+    (re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I), "depositsandadditions"),
+    (re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),                       "checkspaid"),
+    (re.compile(r'^\s*CHECK\s*NO\.\s*DESCRIPTION\b', re.I),           "checkspaid"),  # <- new alt header
+    (re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I), "atmdebitwithdrawal"),
+    (re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),            "electronicwithdrawal"),
+    ]
+
+    MAJOR_STOP = re.compile(
+        r"^(?:\s*)(?:CHECKING\s+SUMMARY|CHECK\s+NO\.\s+DESCRIPTION|"
+        r"CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"
+        r"ELECTRONIC\s+WITHDRAWALS?|DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?))\b",
+        re.I
+    )
+
+    kept, i, N = [], 0, len(lines)
+    while i < N:
+        hit = None
+        for rx, key in HDRS:
+            if rx.search(lines[i] or ""):
+                hit = (rx, key, i)
+                break
+        if not hit:
+            i += 1
             continue
-        tag, name = m.groups()
-        name = name.strip().lower()
-        # Normalize: remove trailing 'section3', 'section2', etc.
-        name = re.sub(r"\s*section\d+\b", "", name)
-        if tag.lower() == "start":
-            current = {"name": name, "start": i}
-        elif tag.lower() == "end" and current and current["name"] == name:
-            current["end"] = i
-            sections.append(current)
-            current = None
 
-    if debug:
-        print(f"[markers] found {len(sections)} section spans:")
-        for s in sections:
-            print(f"    {s['name']} ({s['start']}–{s.get('end')})")
+        rx, key, start = hit
+        j = start + 1
+        while j < N and not MAJOR_STOP.match(lines[j] or ""):
+            j += 1
 
-    # For Chase, keep only the sections between "deposits" and "electronic withdrawals"
-    keep_names = {"deposits and additions", "checks paid", "atm debit withdrawal", "electronic withdrawal"}
-    keep_spans = [s for s in sections if any(k in s["name"] for k in keep_names)]
+        if key in want_present:
+            kept.extend(lines[start:j])
 
-    # Flatten into a list of line ranges
-    kept_lines = []
-    for s in keep_spans:
-        start, end = s["start"], s.get("end", len(lines))
-        kept_lines.extend(lines[start:end])
+        i = j
 
-    if debug:
-        print(f"[markers] kept {len(kept_lines)} of {len(lines)} total lines")
-    return kept_lines
+    if debug: print(f"[markers] kept {len(kept) or len(lines)} lines (header-sliced)")
+    return kept or lines  # fail-open
 
 # --- Single-pass stream parser (deposits → checks → atm → electronic) ---
 MAJOR_BREAK = re.compile(r'^\s*(TRANSACTION\s+DETAIL|DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE)\b', re.I)
@@ -577,6 +656,17 @@ def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=Fal
     while i < N:
         raw = lines[i]
         line = norm(raw)
+        # --- Savings guards: skip Savings tables/rows outright ---
+        if re.search(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', line, re.I):
+        # We’re in a Savings detail table → ignore rows until next major section
+            i += 1
+            while i < N and not (MAJOR_STOP.match(norm(lines[i])) or NEXT_SEC.search(norm(lines[i]))):
+                i += 1
+            continue
+        # If a row has a date AND the word BALANCE, it’s almost certainly a Savings detail line
+        if DATE_LINE.match(line) and "BALANCE" in line.upper():
+            i += 1
+            continue
         is_amt_line = AMT_RE.search(line) is not None  # <— add this once near the top of the loop 
         if not line:
             i += 1
@@ -628,6 +718,13 @@ def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=Fal
 
         # ---- Date-led transaction line ----
         mdate = DATE_LINE.match(line)
+        if mdate:
+        # --- Savings-style guard: date line that also shows BALANCE or 2 amounts on the same line
+            amatches_same = list(AMT_RE.finditer(line))
+            if "BALANCE" in line.upper() or len(amatches_same) >= 2:
+            # This is a Savings detail row or a non-checking table format → skip it entirely
+                i += 1
+                continue
         if mdate:
             mm, dd = int(mdate.group(1)), int(mdate.group(2))
             year   = assign_year(end_year, end_month, mm)
@@ -745,32 +842,54 @@ def write_df(ws, df):
     ws.column_dimensions[get_column_letter(4)].width = 12
 
 def merge_dedup(old, new):
-    # normalize empties
-    old_empty = old is None or getattr(old, "empty", True)
-    new_empty = new is None or getattr(new, "empty", True)
+    """
+    Overwrite-merge on (Date, Description, Amount):
+      - Drop any OLD rows whose key exists in NEW
+      - Append NEW rows
+      - Drop residual dups (keep last), sort by Date
+    """
+    import pandas as pd
 
-    if old_empty and new_empty:
-        return pd.DataFrame(columns=["Date","Description","Category","Amount"]).astype({
-            "Date": "datetime64[ns]", "Description": "string", "Category": "string", "Amount": "float64",
-        })
-    comb = new.copy() if old_empty else (old.copy() if new_empty else pd.concat([old, new], ignore_index=True))
+    # Normalize empties
+    old = old if isinstance(old, pd.DataFrame) else pd.DataFrame(columns=["Date","Description","Category","Amount"])
+    new = new if isinstance(new, pd.DataFrame) else pd.DataFrame(columns=["Date","Description","Category","Amount"])
 
-    # dtype hygiene
-    comb["Date"] = pd.to_datetime(comb["Date"], errors="coerce")
-    comb["Description"] = comb["Description"].astype(str)
-    if "Category" not in comb.columns:
-        comb["Category"] = ""
-    comb["Category"] = comb["Category"].astype(str)
-    comb["Amount"] = pd.to_numeric(comb["Amount"], errors="coerce")
+    # Ensure expected columns exist
+    for df in (old, new):
+        for col in ["Date","Description","Category","Amount"]:
+            if col not in df.columns:
+                df[col] = "" if col != "Amount" else 0.0
 
-    # per-sheet dedupe
-    comb["dupe_key"] = (
-        comb["Date"].dt.strftime("%Y-%m-%d")
-        + "||" + comb["Description"]
-        + "||" + comb["Amount"].astype(str)
-    )
-    comb = comb.drop_duplicates(subset=["dupe_key"]).drop(columns=["dupe_key"])
-    return comb.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    # Dtypes
+    for df in (old, new):
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df["Description"] = df["Description"].astype(str)
+        df["Category"] = df["Category"].astype(str)
+        df["Amount"] = pd.to_numeric(df["Amount"], errors="coerce")
+
+    # Keys
+    def make_key(df):
+        return (
+            df["Date"].dt.strftime("%Y-%m-%d")
+            + "||" + df["Description"].str.strip()
+            + "||" + df["Amount"].round(2).astype(str)
+        )
+
+    old_key = make_key(old)
+    new_key = make_key(new)
+
+    # Drop any old rows whose key is present in NEW (so new category overwrites)
+    old_keep = ~old_key.isin(set(new_key))
+    combined = pd.concat([old.loc[old_keep], new], ignore_index=True)
+
+    # Safety: drop residual dups, keep last (i.e., NEW)
+    combined["_key"] = make_key(combined)
+    combined = combined.drop_duplicates(subset=["_key"], keep="last").drop(columns=["_key"])
+
+    return (combined
+            .dropna(subset=["Date"])
+            .sort_values("Date")
+            .reset_index(drop=True))
 
 # --- Build Monthly & Yearly summaries with safe TOTAL rows ---
 def build_summaries_with_totals(stack: pd.DataFrame):
@@ -896,7 +1015,7 @@ def clip_to_checking_lines(lines, *, debug: bool=False):
                 print(f"[clip2] Truncating at Savings SUMMARY (line {i+1}): {line!r}")
             break
         elif SAVINGS_BANNER.search(line):
-            last_savings_banner = i
+            in_savings = True
             if debug:
                 print(f"[clip2] SAVINGS banner at line {i+1}: {line!r}")
             continue
@@ -1009,11 +1128,19 @@ def main():
         return
 
     # Read raw statement text
+    # --- read & normalize the raw text BEFORE any clipping ---
+    raw_txt = Path(args.input).read_text(encoding="utf-8", errors="ignore")
+    # normalize unicode (helps with odd spaces) and treat form feeds as newlines
+    raw_txt = unicodedata.normalize("NFKC", raw_txt).replace("\r", "").replace("\x0c", "\n")
+    raw_lines = raw_txt.split("\n")
+    
     lines = input_path.read_text(encoding="utf-8", errors="ignore").splitlines()
-
+    
     # 1) Coarse page-level clip (existing behavior)
     if args.pdf:
         lines = pdf_clip_checking_pages(args.pdf, lines, debug=args.debug)
+    else:
+        lines = clip_after_post_fees_block(lines, debug=args.debug)
 
     def _count_date_lines(seq):
         return sum(1 for ln in seq if re.match(r'^\d{1,2}/\d{2}\b', ln))
@@ -1031,6 +1158,21 @@ def main():
     orig_dates = _count_date_lines(pageclip_lines) or _count_date_lines(lines)
     band_dates = _count_date_lines(band_lines) if band_lines else 0
     healthy = bool(band_lines) and (band_dates >= max(5, int(0.5 * (orig_dates or 0))))
+    def strip_savings_tables(raw_lines: list[str]) -> list[str]:
+        out, skip = [], False
+        for s in raw_lines:
+            t = (s or "").strip()
+            # Start skipping at the Savings 4-col header
+            if re.search(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', t, re.I):
+                skip = True
+                continue
+            # Stop skipping when we hit a clear section break
+            if skip and (MAJOR_STOP.match(t) or NEXT_SEC.search(t)):
+                skip = False
+                continue
+            if not skip:
+                out.append(s)
+        return out
 
     if args.debug:
         print(f"[pdf-band] date-lines: band={band_dates} vs orig={orig_dates} -> healthy={healthy}")
@@ -1049,15 +1191,48 @@ def main():
     if args.debug:
         Path("debug_band_lines.txt").write_text("\n".join(lines), encoding="utf-8")
         print("[pdf-band] wrote debug_band_lines.txt for inspection")
+    # Establish Begin and End balances from raw_lines
+    begin_bal: float | None = None
+    end_bal:   float | None = None
+
+    # Prefer raw_lines so clipping can’t hide the header row
+    b_hdr, e_hdr = parse_begin_end_balances(raw_lines, debug=getattr(args, "debug", False))
+    if b_hdr is not None: begin_bal = b_hdr
+    if e_hdr is not None: end_bal   = e_hdr
 
     # 3) Keep the text-only guard as a final safety net
-    lines = clip_to_checking_lines(lines, debug=args.debug)
+    # Final text-only safety: drop any Savings tables that slipped through
+    lines = strip_savings_tables(lines)
+    checking_lines = clip_to_checking_lines(lines, debug=args.debug)
+    def _has_txn_header(seq):
+        H = [
+            re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I),
+            re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),
+            re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I),
+            re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),
+            re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\b', re.I),
+        ]
+        return any(rx.search(s or "") for s in seq for rx in H)
+
+    if checking_lines and _has_txn_header(checking_lines):
+        lines = checking_lines[:]
+        if args.debug: print(f"[clip2] using checking_lines ({len(lines)} rows)")
+    else:
+        if args.debug:
+            why = "empty" if not checking_lines else "no headers in checking_lines"
+            print(f"[clip2] fallback to pre-checking slice because {why}")
+
+    # ✅ From here on, parse only the checking slice
+    lines = checking_lines[:] if checking_lines else lines
     if args.debug:
         Path("debug_band_lines.txt").write_text("\n".join(lines), encoding="utf-8")
         print("[pdf-band] wrote debug_band_lines.txt (POST-CLIP) for inspection")
 
     # Parse balances & statement end date
-    begin_bal, end_bal = parse_begin_end_balances(lines)
+    # Parse balances & statement end date (DON’T overwrite if we already have them)
+    b_hdr2, e_hdr2 = parse_begin_end_balances(lines, debug=getattr(args, "debug", False))
+    if begin_bal is None and b_hdr2 is not None: begin_bal = b_hdr2
+    if end_bal   is None and e_hdr2 is not None: end_bal   = e_hdr2
     end_year, end_month = parse_end_date_from_filename(input_path)
 # --- define candidates up-front so they always exist in this scope ---
     b2: float | None = None
@@ -1068,10 +1243,10 @@ def main():
 
     # --- compute candidates (some may stay None) ---
     if begin_bal is None or end_bal is None:
-        b2, e2 = parse_begin_end_balances(pageclip_lines)
+        b2, e2 = parse_begin_end_balances(checking_lines)
 
-    begin_fallback, end_fallback = _balances_from_account_line(pageclip_lines)
-
+    begin_fallback, end_fallback = _balances_from_account_line(checking_lines)
+    totals = {}
     if (begin_bal is None or end_bal is None) and getattr(args, "pdf", None):
         totals = parse_pdf_totals(args.pdf) or {}
 
@@ -1105,6 +1280,9 @@ def main():
         ("acctline", end_fallback),
         ("pdf", totals.get("end")),
     )
+    if getattr(args, "debug", False) and not checking_lines:
+        print("[markers] checking window empty; using pageclip_lines for transactions as fallback")
+        checking_lines = pageclip_lines[:] # fallback so you still ingest transactions
     if getattr(args, "debug", False):
         print(f"[balances] begin={begin_bal} (from {begin_src}); end={end_bal} (from {end_src})")
 
@@ -1125,7 +1303,7 @@ def main():
                 s = lines[j].rstrip("\n")
                 print(f"{j+1:04d} {s!r}")
         _dump_dep_add_window()
-
+   
     # ---------------- PARSE ----------------
     rows = parse_stream_simple(lines, end_year, end_month, debug=args.debug)
     df = pd.DataFrame(rows, columns=["Date","Description","Amount","_src"])
@@ -1178,11 +1356,51 @@ def main():
             pos_mask = desc.str.contains("|".join(map(re.escape, pos_kw)))
             df.loc[unknown & neg_mask, "Amount"] = -df.loc[unknown & neg_mask, "Amount"].abs()
             df.loc[unknown & pos_mask, "Amount"] = df.loc[unknown & pos_mask, "Amount"].abs()
+    # === Category normalization (put near the end of parse, before writing to Excel) ===
+    CANON = {
+        "food & drink": "Food & Drink",
+        "food/drink": "Food & Drink",
+        "groceries": "Groceries",
+        "gas": "Gas",
+        "utilities": "Utilities",
+        "insurance": "Insurance",
+        "health": "Health & Wellness",
+        "health & wellness": "Health & Wellness",
+        "shopping": "Shopping",
+        "entertainment": "Entertainment",
+        "golf": "Golf / Sports",
+        "golf / sports": "Golf / Sports",
+        "transportation": "Transportation",
+        "donations": "Donations",
+        "refund / return": "Refund / Return",
+        "deposit (other)": "Deposit (Other)",
+        "transfer in": "Transfer In",
+        "transfer out": "Transfer Out",
+        "interest": "Interest",
+        "income": "Income",
+        "checks": "Checks",
+        "card/atm": "Card/ATM",
+        "electronic": "Electronic",
+        "other": "Other",
+    }
+
+    def _canonize(cat: str) -> str:
+        if not isinstance(cat, str): return "Other"
+        key = cat.strip().lower()
+        return CANON.get(key, cat.strip().title())
+
+    df["Category"] = df["Category"].apply(_canonize)
 
     # Targeted fix: any 'online payment ... to ... credit card' should be negative
     desc_all = df["Description"].astype(str).str.lower().fillna("")
     fix_mask = desc_all.str.contains(r"online payment.*to .*credit card")
     df.loc[fix_mask, "Amount"] = -df.loc[fix_mask, "Amount"].abs()
+    # === Guardrail: alert if "Other" is large ===
+    other_sum = df.loc[df["Category"]=="Other","Amount"].sum()
+    total_spend = df.loc[df["Amount"]<0,"Amount"].abs().sum()
+    if abs(other_sum) > 5000 or (total_spend and abs(other_sum)/total_spend > 0.10):
+        print(f"[WARN] 'Other' unusually large: {other_sum:+.2f} "
+            f"({(abs(other_sum)/total_spend*100):.1f}% of spending)")
 
     if args.debug:
         amb = df[~df["_src"].isin(["DEP_ADD","CHECKS","ATM","ELEC"])][["Date","Description","Amount","_src"]].head(30)
@@ -1190,18 +1408,17 @@ def main():
             print("\n[DEBUG] Rows without section (signed via keywords):")
             print(amb.to_string(index=False))
     # ---------------- BALANCE ADJUSTMENT (make ledger match statement end) ----------------
-    try:
-        dep_total_calc = float(df.loc[df["Amount"] > 0, "Amount"].sum())
-        wd_total_calc  = float((-df.loc[df["Amount"] < 0, "Amount"]).sum())
-        computed_end   = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
+    #    dep_total_calc = float(df.loc[df["Amount"] > 0, "Amount"].sum())
+    #    wd_total_calc  = float((-df.loc[df["Amount"] < 0, "Amount"]).sum())
+    #    computed_end   = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
 
-        if computed_end is not None and end_bal is not None:
-            needed_delta = round(end_bal - computed_end, 2)   # <-- amount to add to ledger
-            if abs(needed_delta) >= float(getattr(args, "adjust_threshold", 0.02)):
-                df = _append_adj(df, needed_delta, "balance delta")
-                print(f"[balance-adjust] added {needed_delta:+.2f}")
-    except Exception as e:
-        print(f"[balance-adjust] skipped due to error: {e}")
+    #    if computed_end is not None and end_bal is not None:
+    #        needed_delta = round(end_bal - computed_end, 2)   # <-- amount to add to ledger
+    #        if abs(needed_delta) >= float(getattr(args, "adjust_threshold", 0.02)):
+    #            df = _append_adj(df, needed_delta, "balance delta")
+    #            print(f"[balance-adjust] added {needed_delta:+.2f}")
+    #except Exception as e:
+    #    print(f"[balance-adjust] skipped due to error: {e}")
 
     # ---------------- RECON DETAIL (last run) ----------------
     try:
@@ -1265,7 +1482,9 @@ def main():
         aggfunc="sum", fill_value=0
     ).reset_index()
     rebuild_sheet(wb, "YOY Comparison", yoy)
-    
+    if args.debug:
+        print(df["_src"].value_counts(dropna=False))
+        print(df[df["Amount"] < 0].groupby("_src")["Amount"].sum())
     # ---------------- BALANCE RECONCILIATION ----------------
     try:
         dep_total_calc = float(df.loc[df["Amount"] > 0, "Amount"].sum())
@@ -1323,20 +1542,37 @@ def main():
             "Diff": (None if stmt_diff is None else round(stmt_diff, 2)),
         }
 
-        # Upsert by Statement End date
-        if "Statement End" in recon_df.columns and not recon_df.empty:
-            recon_df = recon_df[recon_df["Statement End"] != new_row["Statement End"]]
-        row_df = pd.DataFrame([{**{c: pd.NA for c in recon_df.columns}, **new_row}], columns=recon_df.columns)
-        if row_df is not None and not row_df.empty:
-            recon_df = pd.concat([recon_df, row_df], ignore_index=True)
+        ## Upsert by Statement End date (compact + robust)
+        EXPECTED_COLS = [
+            "Statement End","Begin","Deposits (calc)","Withdrawals (calc)","Computed End",
+            "Statement End (reported)","Diff","Stmt Deposits","Stmt Withdrawals","Δ Deposits","Δ Withdrawals"
+        ]
 
-        # Sort by date
-        if not recon_df.empty and "Statement End" in recon_df.columns:
-            try:
-                recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
-                recon_df = recon_df.sort_values("Statement End").reset_index(drop=True)
-            except Exception:
-                pass
+        # 1) Normalize recon_df to the expected schema (handles “sheet exists with odd headers”)
+        if not isinstance(recon_df, pd.DataFrame):
+            recon_df = pd.DataFrame(columns=EXPECTED_COLS)
+        recon_df = recon_df.reindex(columns=EXPECTED_COLS)
+
+        # 2) Build a one-row DF for the new record, already aligned to the schema
+        row_df = pd.DataFrame([new_row]).reindex(columns=EXPECTED_COLS)
+
+        # 3) True upsert: drop any existing row with the same Statement End
+        if not recon_df.empty:
+            recon_df = recon_df[recon_df["Statement End"] != row_df.iloc[0]["Statement End"]]
+
+        # 4) Append without triggering the empty/all-NA concat warning
+        parts = []
+        if not recon_df.empty and not recon_df.isna().all().all():
+            parts.append(recon_df)
+        if not row_df.empty and not row_df.isna().all().all():
+            parts.append(row_df)
+
+        recon_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=EXPECTED_COLS)
+
+        # 5) Sort by date safely
+        if not recon_df.empty:
+            recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
+            recon_df = recon_df.sort_values("Statement End").reset_index(drop=True)
 
         rebuild_sheet(wb, sheet_name, recon_df)
         if args.debug:

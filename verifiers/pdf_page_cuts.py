@@ -63,21 +63,6 @@ def _find_y_of_phrase(page, regexes) -> list:
                 hits.append(row["top"])
                 break
     return hits
-CHECKING_HDRS = [
-    r"DEPOSITS\s+AND\s+ADDITIONS",
-    r"CHECKS?\s+PAID",
-    r"CHECK\s*NO\.\s+DESCRIPTION",            # NEW: checks table header
-    r"ATM\s*&\s*DEBIT\s*CARD\s+WITHDRAWALS",  # matches "(continued)" too
-    r"ELECTRONIC\s+WITHDRAWALS"               # matches "(continued)" too
-]
-HDR_RE_LIST = [re.compile(h, re.I) for h in CHECKING_HDRS]
-
-SAVINGS_BANNERS = [
-    r"SAVINGS\s+SUMMARY",
-    r"CHASE\s+SAVINGS",
-    r"^SAVINGS\b"
-]
-SAV_RE_LIST = [re.compile(s, re.I) for s in SAVINGS_BANNERS]
 def _dump_words(page, tag, *, debug=False):
     if not debug:
         return

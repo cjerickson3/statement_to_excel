@@ -46,3 +46,11 @@ Panera Bread,Food & drink,contains,0
 Chiloso,Food & drink,contains,0
 MCDONALD'S ,Food & drink,contains,0
 Cinemark,Entertainment,contains,0
+Skype,Utilities: Phone/VOIP,contains,False
+Northwestern Mu,Insurance: Life,contains,False
+Sparrowhawk Sola,Home: Solar/Utilities,contains,False
+Unitedhealthone,Insurance: Health,contains,False
+IAT,Electronic,contains,False
+PPD,Electronic,contains,False
+ECHECK,Electronic,contains,False
+WEB ID,Electronic,contains,False
