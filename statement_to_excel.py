@@ -656,6 +656,12 @@ def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=Fal
     while i < N:
         raw = lines[i]
         line = norm(raw)
+        # inside parse_stream_simple loop, right after `line = norm(raw)`
+        if DATE_LINE.match(line) and sum(1 for _ in AMT_RE.finditer(line)) >= 2:
+            # Savings-style row (txn amount + running balance) → skip
+            i += 1
+            continue
+
         # --- Savings guards: skip Savings tables/rows outright ---
         if re.search(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', line, re.I):
         # We’re in a Savings detail table → ignore rows until next major section
@@ -976,26 +982,12 @@ def upsert_summary_sheet(wb, name: str, new_df: pd.DataFrame, key_col: str):
     rebuild_sheet(wb, name, combined)
 
 def clip_to_checking_lines(lines, *, debug: bool=False):
-    """
-    Keep only the CHECKING portion of the statement.
-    Once a SAVINGS banner appears, truncate immediately when we see any Savings
-    transaction header (Deposits/Additions, Checks Paid, ATM/Debit, Electronic)
-    or the first date-led line under the Savings context.
-    """
-    SAVINGS_BANNER   = re.compile(r'\bCHASE\s+SAVINGS\b|\bSAVINGS\s+SUMMARY\b|\bSAVINGS\b', re.I)
-    SAVINGS_SUMMARY = re.compile(r'^\s*SAVINGS\s+SUMMARY\b', re.I)
-    CHECKING_BANNER  = re.compile(r'\bCHECKING\b', re.I)
-
-    # Section headers that start transaction detail blocks on Chase statements
-    TXN_HEADERS = [
-        re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I),
-        re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),
-        re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I),
-        re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),
-        re.compile(r'^\s*(TRANSACTIONS?\s+DETAIL|ACCOUNT\s+ACTIVITY)\b', re.I),
-    ]
-
-    DATE_HEAD = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])\b')
+    import re
+    SAVINGS_BANNER    = re.compile(r'^\s*(?:CHASE\s+SAVINGS|SAVINGS\s+SUMMARY)\s*$', re.I)
+    SAVINGS_TABLEHDR  = re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', re.I)
+    SAVINGS_SUMMARY   = re.compile(r'^\s*SAVINGS\s+SUMMARY\b', re.I)
+    CHECKING_BANNER   = re.compile(r'\bCHECKING\b', re.I)
+    DATE_HEAD         = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])\b')
 
     end_idx = len(lines)
     in_savings = False
@@ -1004,28 +996,35 @@ def clip_to_checking_lines(lines, *, debug: bool=False):
         line = (raw or "").strip()
 
         if CHECKING_BANNER.search(line):
-            # re-entered checking; any prior savings banner no longer applies
             in_savings = False
             if debug: print(f"[clip2] CHECKING context at line {i+1}: {line!r}")
             continue
 
+        # 1) Hard stop if we see Savings summary/banner
         if SAVINGS_SUMMARY.search(line):
             end_idx = i
-            if debug:
-                print(f"[clip2] Truncating at Savings SUMMARY (line {i+1}): {line!r}")
+            if debug: print(f"[clip2] Truncating at Savings SUMMARY (line {i+1}): {line!r}")
             break
         elif SAVINGS_BANNER.search(line):
             in_savings = True
-            if debug:
-                print(f"[clip2] SAVINGS banner at line {i+1}: {line!r}")
+            if debug: print(f"[clip2] SAVINGS banner at line {i+1}: {line!r}")
             continue
-        if in_savings:
-            # If we see any transaction header or a date-led row while in Savings,
-            # that means Savings detail is starting → truncate here.
-            if any(p.search(line) for p in TXN_HEADERS) or DATE_HEAD.match(line):
+
+        # 2) NEW: Truncate at the first line that looks like Savings detail:
+        #    a date-led row that contains TWO monetary amounts (txn + running balance)
+        if DATE_HEAD.match(line):
+            amt_count = sum(1 for _ in AMT_RE.finditer(line))
+            if amt_count >= 2:
                 end_idx = i
-                if debug: print(f"[clip2] Truncating before Savings details at line {i+1}: {line!r}")
+                if debug:
+                    print(f"[clip2] Truncating at first date+two-amounts line (line {i+1}): {line!r}")
                 break
+
+        # 3) If we've seen a Savings banner, cut right before actual Savings table/detail starts
+        if in_savings and (SAVINGS_TABLEHDR.search(line)):
+            end_idx = i
+            if debug: print(f"[clip2] Truncating before Savings details at line {i+1}: {line!r}")
+            break
 
     clipped = lines[:end_idx]
     if debug and len(clipped) != len(lines):
@@ -1203,7 +1202,11 @@ def main():
     # 3) Keep the text-only guard as a final safety net
     # Final text-only safety: drop any Savings tables that slipped through
     lines = strip_savings_tables(lines)
-    checking_lines = clip_to_checking_lines(lines, debug=args.debug)
+    # ✅ Only use the text-only guard if we didn’t already extract a healthy band
+    if not args.pdf or not healthy:
+        checking_lines = clip_to_checking_lines(lines, debug=args.debug)
+    else:
+        checking_lines = lines[:]  # PDF band already provided clean checking slice  
     def _has_txn_header(seq):
         H = [
             re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I),
