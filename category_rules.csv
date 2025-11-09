@@ -1,56 +1,102 @@
 keyword,category,match_type,case_sensitive
-WAL-MART,Groceries,contains,0
-Kroger,Groceries,contains,0
-Tom Thumb,Groceries,contains,0
-H-E-B ,Groceries,contains,0
-Wholefds,Groceries,contains,0
-Sprouts Farmers Mkt,Groceries,contains,0
-Central Market,Groceries,contains,0
-Costco Whse,Groceries,contains,0
- Brookshir,Groceries,contains,0
-Aldi,Groceries,contains,0
-Trader Joe's,Groceries,contains,0
-PERSHING,401K transfer,contains,0
-ONLINE PAYMENT,Online payment,contains,0
-HOME DEPOT,Home Repair,contains,0
-LOWE'S,Home Repair,contains,0
-GOLF,Golf,contains,0
-Glf,Golf,contains,0
-Pga Tour ,Golf,contains,0
-WELLCARE,Health & wellness,contains,0
-GoldenRule,Health & wellness,contains,0
-CHIROPRACT,Health & wellness,contains,0
-Aetna,Health & wellness,contains,0
-Humana,Health & wellness,contains,0
-Racetrac,Gasoline,contains,0
-Buc-Ee's,Gasoline,contains,0
-Quiktrip,Gasoline,contains,0
-KERA,Donations,contains,0
-Salata,Food & drink,contains,0
-Fish Shack,Food & drink,contains,0
-Little Greek,Food & drink,contains,0
-TST*,Food & drink,startswith,1
-Chick-Fil-A,Food & drink,contains,0
-Jersey Mikes,Food & drink,contains,0
-Taco Bell,Food & drink,contains,0
-Potbelly,Food & drink,contains,0
-Modernmkt,Food & drink,contains,0
-Fuzzy's Taco Shop,Food & drink,contains,0
-Tacodeli,Food & drink,contains,0
-Starbucks,Food & drink,contains,0
-Braums Store,Food & drink,contains,0
-Original Chop Shop,Food & drink,contains,0
-LA Madeleine,Food & drink,contains,0
-Jasons Deli,Food & drink,contains,0
-Panera Bread,Food & drink,contains,0
-Chiloso,Food & drink,contains,0
-MCDONALD'S ,Food & drink,contains,0
-Cinemark,Entertainment,contains,0
-Skype,Utilities: Phone/VOIP,contains,False
-Northwestern Mu,Insurance: Life,contains,False
-Sparrowhawk Sola,Home: Solar/Utilities,contains,False
-Unitedhealthone,Insurance: Health,contains,False
-IAT,Electronic,contains,False
-PPD,Electronic,contains,False
-ECHECK,Electronic,contains,False
-WEB ID,Electronic,contains,False
+Aetna Health IN,Insurance,contains,False
+SSA TREAS,Payroll,contains,False
+PAYROLL,Payroll,contains,False
+DIRECT DEP,Payroll,contains,False
+OASISBATCH,Payroll,contains,False
+Income Pmt,Income,contains,False
+DV02DT,Income,contains,False
+DIVIDEND,Income,contains,False
+INTEREST,Interest,contains,False
+INTEREST PAYMENT,Interest,contains,False
+INT CREDIT,Interest,contains,False
+Purchase Return,Refund / Return,contains,False
+Card Purchase Return,Refund / Return,contains,False
+REFUND,Refund / Return,contains,False
+REVERSAL,Refund / Return,contains,False
+ATM Check Deposit,Deposit (Other),contains,False
+DEPOSIT,Deposit (Other),contains,False
+Online Transfer From,Transfer In,contains,False
+TRANSFER FROM,Transfer In,contains,False
+PERSHING BROKERAGE,Transfer In,contains,False
+Online Payment,Transfer Out,contains,False
+TRANSFER TO,Transfer Out,contains,False
+VENMO PAYMENT,Transfer Out,contains,False
+ZELLE TO,Transfer Out,contains,False
+ZELLE,Transfer Out,contains,False
+USAA CREDIT CARD,Transfer Out,contains,False
+PAYMENT TO,Transfer Out,contains,False
+CITY OF PLANO,Utilities,contains,False
+ATMOS,Utilities,contains,False
+RELIANT,Utilities,contains,False
+TXU,Utilities,contains,False
+ONCOR,Utilities,contains,False
+SPECTRUM,Utilities,contains,False
+AT&T,Utilities,contains,False
+COMCAST,Utilities,contains,False
+NORTHWESTERN MUTUAL,Insurance,contains,False
+Northwestern Mu isa, Insurance,contains,False
+ALLSTATE,Insurance,contains,False
+GEICO,Insurance,contains,False
+PROGRESSIVE,Insurance,contains,False
+STATE FARM,Insurance,contains,False
+UNITEDHEALTH,Insurance,contains,False
+Unitedhealthone,Insurance,contains,False
+BLUE CROSS,Insurance,contains,False
+CVS,Health & Wellness,contains,False
+WALGREENS,Health & Wellness,contains,False
+WALGREEN,Health & Wellness,contains,False
+DENTAL,Health & Wellness,contains,False
+CHIROPRACT,Health & Wellness,contains,False
+HOSPITAL,Health & Wellness,contains,False
+H-E-B,Groceries,contains,False
+HEB,Groceries,contains,False
+KROGER,Groceries,contains,False
+TOM THUMB,Groceries,contains,False
+TRADER JOE,Groceries,contains,False
+CENTRAL MARKET,Groceries,contains,False
+WHOLEFDS,Groceries,contains,False
+WHOLE FOODS,Groceries,contains,False
+ALBERTSONS,Groceries,contains,False
+COSTCO,Groceries,contains,False
+SAM'S CLUB,Groceries,contains,False
+JERSEY MIKE,Food & Drink,contains,False
+SUSHI,Food & Drink,contains,False
+PANERA,Food & Drink,contains,False
+STARBUCKS,Food & Drink,contains,False
+MCDONALD,Food & Drink,contains,False
+TACO,Food & Drink,contains,False
+SUBWAY,Food & Drink,contains,False
+CHICK-FIL-A,Food & Drink,contains,False
+CHIPOTLE,Food & Drink,contains,False
+AMAZON,Shopping,contains,False
+TARGET,Shopping,contains,False
+WALMART,Shopping,contains,False
+HOME DEPOT,Shopping,contains,False
+LOWE'S,Shopping,contains,False
+LOWES,Shopping,contains,False
+ELLIOTTS HRDWRE,Shopping,contains,False
+ELLIOTT,Shopping,contains,False
+BEST BUY,Shopping,contains,False
+SHELL,Gas,contains,False
+EXXON,Gas,contains,False
+CHEVRON,Gas,contains,False
+MOBIL,Gas,contains,False
+QT ,Gas,contains,False
+QUIKTRIP,Gas,contains,False
+TOLLWAY,Transportation,contains,False
+NTTA,Transportation,contains,False
+CHURCH,Donations,contains,False
+FOUNDATION,Donations,contains,False
+KERA,Donations,contains,False
+DONATION,Donations,contains,False
+NETFLIX,Entertainment,contains,False
+SPOTIFY,Entertainment,contains,False
+HULU,Entertainment,contains,False
+MUSEUM,Entertainment,contains,False
+MOVIE,Entertainment,contains,False
+GOLF,Golf / Sports,contains,False
+TENNIS,Golf / Sports,contains,False
+ORANGETHEORY,Golf / Sports,contains,False
+PELOTON,Golf / Sports,contains,False
+Sparrowhawk, Utilities,contains,False

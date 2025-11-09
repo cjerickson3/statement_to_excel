@@ -49,4 +49,5 @@ data/raw/
 Analysis/
 # local backups of verifiers
 debug_band_lines*.txt
+Ingest_log.xlsx
 debug_words_p?_band.tsv
