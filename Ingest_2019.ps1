@@ -19,7 +19,6 @@ foreach ($pdf in $pdfFiles) {
 
     $args = @(
         $pdf.FullName,
-        "--rules", "category_rules.txt",
         "--dashboard", "Chase_Budget_Dashboard.xlsx",
         "--debug"
     )
