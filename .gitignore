@@ -7,6 +7,10 @@ __pycache__/
 .venv/
 venv/
 env/
+# Secrets (use .env.example to share keys schema)
+.env
+*.key
+*.pem
 
 # Packaging / build
 build/
@@ -31,17 +35,19 @@ Thumbs.db
 htmlcov/
 .coverage*
 *.log
-Chase_Budget_Dashboard.xlsx
+Chase_Budget_Dashboard*.xlsx
+debug_band_lines.txt
 *_Audit*.xlsx
 # Project-specific artifacts
+templates/
 output/
 **/output/**
 # Data dumps (keep small redacted samples only)
 data/raw/
 **/History_text/**
 **/Chase_history/**
-
-# Secrets (use .env.example to share keys schema)
-.env
-*.key
-*.pem
+Analysis/
+# local backups of verifiers
+debug_band_lines*.txt
+Ingest_log.xlsx
+debug_words_p?_band.tsv

@@ -1,14 +1,34 @@
-# Set your paths
-$root      = "C:\Users\chris\Documents\2425_Delmar\Budget"
-$script    = Join-Path $root "text-to-excel.py"
-$inDir     = Join-Path $root "History_text"
-$dashboard = Join-Path $root "Chase_Budget_Dashboard.xlsx"   # change if yours is named differently
-# $rules     = Join-Path $root "rules.csv"        # optional
+# --- Ingest_2019.ps1 ---
+param([int]$Year = 2019)
 
-# Ingest all 2019*-prefixed .txt files
-Get-ChildItem -LiteralPath $inDir -File -Filter "2019*.txt" |
-  Sort-Object Name |
-  ForEach-Object {
-    python $script --input $_.FullName --dashboard $dashboard 
-    # If you don't have a rules file, drop:  --rules $rules
-  }
+Write-Host "=== Processing Chase statements for $Year ==="
+
+$scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$historyDir = Join-Path $scriptDir "Chase_history"
+$pythonExe  = "python"
+$scriptPath = Join-Path $scriptDir "statement_to_excel.py"
+
+$pdfFiles = Get-ChildItem -Path $historyDir -Filter "$Year*.pdf" | Sort-Object Name
+if (-not $pdfFiles) {
+    Write-Host "No PDF files found for $Year in $historyDir"
+    exit
+}
+
+foreach ($pdf in $pdfFiles) {
+    Write-Host "-> Processing $($pdf.Name)..."
+
+    $args = @(
+        $pdf.FullName,
+        "--dashboard", "Chase_Budget_Dashboard.xlsx",
+        "--debug"
+    )
+
+    & $pythonExe $scriptPath @args
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "WARNING: Error processing $($pdf.Name)"
+    } else {
+        Write-Host "Done $($pdf.Name)"
+    }
+}
+
+Write-Host "=== Completed processing for $Year ==="

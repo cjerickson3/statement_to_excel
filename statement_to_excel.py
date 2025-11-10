@@ -1,0 +1,1883 @@
+#!/usr/bin/env python3
+"""
+Ingest Chase statement text (from `pdftotext -raw`) into the Dashboard workbook.
+
+Fix in this version:
+- Correct year assignment for statements that straddle months.
+  Uses the end date from the filename (YYYYMMDD).
+  Rule:
+    • If txn_month == end_month → year = end_year
+    • If txn_month == end_month - 1 → year = end_year
+    • Special case: if end_month == 1 and txn_month == 12 → year = end_year - 1
+"""
+
+import re
+import sys
+import subprocess
+import argparse
+from pathlib import Path
+import unicodedata
+import shutil
+import pandas as pd
+import xlsxwriter
+__version__ = "0.10.9"  # bump this when you cut a release/tag
+
+def git_version():
+    try:
+        return subprocess.check_output(
+            ["git", "describe", "--tags", "--dirty", "--always"], text=True
+        ).strip()
+    except Exception:
+        return None
+
+def build_version_string():
+    gv = git_version()
+    print("Version #",gv)
+    return f"{__version__} ({gv})" if gv else __version__
+
+from openpyxl import load_workbook, Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
+import hashlib
+from datetime import datetime
+from verifiers.pdf_plumber_verify import verify_statement_pdf, parse_pdf_totals, get_checking_band_lines
+from verifiers.pdf_page_cuts import pdf_clip_checking_pages
+
+# Regex patterns
+# ONE capturing group so .findall() returns strings
+AMT_RE = re.compile(r"""
+    (                                   # capture the whole amount
+      -?\s*\$?\s*(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}\s*-?   # 1,234.56 or 1234.56, optional $ and trailing -
+      | \(\s*\$?\s*(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}\s*\) # (1,234.56) style negatives
+    )
+""", re.X)
+
+SUBTOTAL_RE = re.compile(r"^\s*Total\s+", re.I)
+HEADER_RE = re.compile(r"^(DATE|DESCRIPTION|AMOUNT)\b", re.I)
+TOP_RE = re.compile(
+    r'(CHECKING SUMMARY|CONSOLIDATED BALANCE SUMMARY|DATE\s+DESCRIPTION\s+AMOUNT)',
+    re.IGNORECASE
+)
+BOTTOM_RE = re.compile(
+    r'(SAVINGS SUMMARY|CHASE\s+SAVINGS)',
+    re.IGNORECASE
+)
+#
+
+# tolerant date at start: MM/DD or M-D (optionally /YYYY) but with real month/day ranges
+# Prefer two-digit matches first: 12 -> 12, 31 -> 31, then allow 1..9
+DATE_LINE   = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])(?:\s*[/-]\s*(\d{2,4}))?')
+DATE_TOKEN  = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])(?:\s*[/-]\s*(\d{2,4}))?')
+DATE_SEARCH = re.compile(r'(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])(?:\s*[/-]\s*(\d{2,4}))?')
+TOT_DEPOSITS_RE = re.compile(r'Total\s+Deposits\s+and\s+Additions\s*\$?\s*([0-9,]+\.\d{2})', re.I)
+TOT_WITHDRAWALS_RE = re.compile(r'Total\s+Withdrawals\s+and\s+Debits\s*\$?\s*([0-9,]+\.\d{2})', re.I)
+# Checks header (the real section header)
+CHECKS_HEADER = re.compile(r'^\s*CHECKS?\s+PAID\b', re.I)
+
+# Check-line signatures (require a check NUMBER, not just the word "check")
+CHECK_NUMBER_INLINE = re.compile(r'\bCHECK\s+#?\d{3,6}\b', re.I)
+
+# Your tolerant check-line patterns from earlier (start-of-line forms)
+
+CHECK_LINE_RE1 = re.compile(
+    r'^\s*(?:CHECK\s+)?(?P<chkno>\d{3,6})\s*(?:(?:\s*[\^\*]\s*)+)?(?P<mmdd>\d{1,2}[/-]\d{1,2})\s+(?P<amt>-?\$?\d[\d,]*\.\d{2})',
+    re.I
+)
+
+CHECK_LINE_RE = re.compile(
+    r"""^\s*
+        (?P<chkno>\d{4,})
+        \s+[\^\*]\s+
+        (?P<mmdd>\d{2}/\d{2})
+        \s+
+        (?P<amt>-?\$?\d{1,3}(?:,\d{3})*\.\d{2})
+        """,
+    re.X
+)
+CHECK_LINE_ALT = re.compile(
+    r'^\s*(?P<chkno>\d{4})\s+Check\s*#\s*(?P=chkno)\b'
+    r'(?P<mid>.*?)(?=\d{1,2}[/-]\d{1,2}\s+\$?[0-9,]+\.\d{2}\s*$)'
+    r'(?P<mmdd>\d{1,2}[/-]\d{1,2})\s+\$?(?P<amt>[0-9,]+\.\d{2})\s*$',
+    re.IGNORECASE
+)
+
+# Begin new add
+# --- Deposits & Additions (sequential) ---
+DATE_START_RE = re.compile(r'^\s*(\d{1,2})\s*[/-]\s*(\d{1,2})')
+#
+# tolerant MM/DD or M-D, optional /YYYY after the day
+
+DEP_ADD_HDR = re.compile(r'Deposits?\s*(?:&|and)?\s*(?:Other\s+)?(?:Additions?|Credits?)', re.I)
+HEADER_ROW = re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\b', re.I)
+
+# any obvious “we’re in checks now” signature
+# Lines that *start* a check row: 4+ digits at the very beginning
+CHECK_SNIFF = re.compile(
+    r'\bCHECK\b|\b\d{4,6}\b\s*(?:[\^\*]\s*)?\d{1,2}\s*[/-]\s*\d{1,2}', re.I
+)
+
+# Matches: Deposits & Additions, Deposits and Additions, Deposits & Other Additions, Deposits & Credits, etc.
+
+# Next-section detectors
+NEXT_SEC = re.compile(
+    r"^(?:\s*(?:Checks?\s+Paid|Electronic\s+(?:Withdrawals?|Payments?)|"
+    r"Debit\s*Card\s*(?:Purchases?|Transactions?)|ATM\s+Withdrawals?))\b",
+    re.I
+)
+MAJOR_STOP = re.compile(
+    r"^(?:\s*)(?:"
+    r"CHECKS?\s+PAID|"                              # checks section header
+    r"ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"      # ATM/DEBIT section
+    r"ELECTRONIC\s+WITHDRAWALS?|"                   # Electronic section
+    r"DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)|"        # Deposits section
+    r"CHECKING\s+SUMMARY"                           # summary banner
+    r")\b",
+    re.I
+)
+
+ATM_DEBIT_HDR = re.compile(r'ATM\s*&?\s*Debit\s*Card\s*Withdrawals?', re.I)
+ELEC_WITH_HDR = re.compile(r'Electronic\s+Withdrawals?', re.I)
+# New Balance code
+# --- Balance parsing helpers ---
+# Prefer the exact phrase you gave us:
+CHECKING_SPECIFIC_RE = re.compile(
+    r"""
+    Chase\s+Better\s+Banking\s+Checking      # literal product+type
+    \s+(?P<acct>\d{6,})                      # account number (6+ digits)
+    \s+\$?(?P<begin>[\d,]+\.\d{2})           # beginning balance
+    \s+\$?(?P<end>[\d,]+\.\d{2})             # ending balance
+    """, re.I | re.X
+)
+
+# General fallback for any "… Checking <acct> $begin $end" header line
+CHECKING_GENERIC_RE = re.compile(
+    r"""
+    \bChecking
+    \s+(?P<acct>\d{6,})
+    \s+\$?(?P<begin>[\d,]+\.\d{2})
+    \s+\$?(?P<end>[\d,]+\.\d{2})
+    \b
+    """, re.I | re.X
+)
+
+BAL_AMT = r"""
+\(?\s*\$?\s*(?:\d{1,3}(?:,\d{3})+|\d+)\.\d{2}\s*\)?   # $1,234.56 or (1,234.56)
+"""
+BAL_AMT_RE = re.compile(BAL_AMT, re.X)
+
+# Common explicit labels Chase prints on some formats
+BEGIN_BAL_RE = re.compile(r"Beginning\s+Balance\s+(" + BAL_AMT + r")", re.I | re.X)
+END_BAL_RE   = re.compile(r"(Ending|Closing)\s+Balance\s+(" + BAL_AMT + r")", re.I | re.X)
+# Match the checking account header with account number + two amounts
+ACCT_LINE_RE = re.compile(
+    r"Checking\s+000000714245263\s+\$?([\d,]+\.\d{2})\s+\$?([\d,]+\.\d{2})",
+    re.I
+)
+
+# --- Text-only truncation after the "post fees" message block ---
+
+POST_FEES_START = re.compile(r'^\*start\*\s*post\s+fees\s+message\b', re.I)
+POST_FEES_END   = re.compile(r'^\*end\*\s*post\s+fees\s+message\b',   re.I)
+ELEC_WITH_HDR = re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I)
+ATM_DEBIT_KWS = re.compile(r'\b(DEBIT\s*CARD|CARD\s*PURCHASE|POS\s*PURCHASE|PIN\s*PURCHASE|VISA\s*CHECK\s*CARD)\b', re.I)
+ELEC_KWS      = re.compile(r'\b(ACH\s*DEBIT|ONLINE\s*PAYMENT|BILL\s*PAY|ZELLE\s+TO|VENMO|AUTOMATIC\s*PAYMENT|PAYMENT\s+TO|TRANSFER\s+TO)\b', re.I)
+SRC_LABEL = {
+    "DEP_ADD": "Deposits",
+    "CHECKS": "Checks",
+    "ATM": "ATM & Debit Withdrawals",
+    "ELEC": "Electronic Withdrawals",
+    "ADJUST": "Adjustment",
+}
+SRC_FILLS = {
+    "Deposits":               PatternFill(fill_type="solid", start_color="E6F4EA"),  # soft green
+    "Checks":                 PatternFill(fill_type="solid", start_color="FDE7E9"),  # soft red
+    "ATM & Debit Withdrawals":PatternFill(fill_type="solid", start_color="FFF4E5"),  # soft orange
+    "Electronic Withdrawals": PatternFill(fill_type="solid", start_color="E8F0FE"),  # soft blue
+    "Adjustment":             PatternFill(fill_type="solid", start_color="F3E8FD"),  # soft purple
+}
+# --- Section totals (text) ---
+TOT_DEP_RE   = re.compile(r"Total\s+Deposits\s+and\s+Additions\s*\$?\s*([0-9,]+\.\d{2})", re.I)
+TOT_CHECKS_RE= re.compile(r"Total\s+Checks\s+Paid\s*\$?\s*([0-9,]+\.\d{2})", re.I)
+TOT_ATM_RE   = re.compile(r"Total\s+ATM\s*&\s*Debit\s*Card\s*Withdrawals\s*\$?\s*([0-9,]+\.\d{2})", re.I)
+TOT_ELEC_RE  = re.compile(r"Total\s+Electronic\s+Withdrawals\s*\$?\s*([0-9,]+\.\d{2})", re.I)
+
+def parse_section_totals(lines: list[str]) -> dict:
+    """
+    Return dict with any of: dep, checks, atm, elec (floats) found in text, else None.
+    """
+    out = {"dep": None, "checks": None, "atm": None, "elec": None}
+    for ln in lines:
+        if out["dep"]    is None:
+            m = TOT_DEP_RE.search(ln);    out["dep"]    = float(m.group(1).replace(",","")) if m else None
+        if out["checks"] is None:
+            m = TOT_CHECKS_RE.search(ln); out["checks"] = float(m.group(1).replace(",","")) if m else None
+        if out["atm"]    is None:
+            m = TOT_ATM_RE.search(ln);    out["atm"]    = float(m.group(1).replace(",","")) if m else None
+        if out["elec"]   is None:
+            m = TOT_ELEC_RE.search(ln);   out["elec"]   = float(m.group(1).replace(",","")) if m else None
+    return out
+
+def is_savings_like(line: str) -> bool:
+    if DATE_LINE.match(line) and sum(1 for _ in AMT_RE.finditer(line)) >= 2:
+        return True
+    if "BALANCE" in line.upper() and DATE_LINE.match(line):
+        return True
+    return False
+
+def classify_withdrawal_line(desc: str) -> str | None:
+    """Return 'ATM' or 'ELEC' or None based on keywords."""
+    if ATM_DEBIT_KWS.search(desc):
+        return "ATM"
+    if ELEC_KWS.search(desc):
+        return "ELEC"
+    return None
+
+
+def clip_after_post_fees_block(lines: list[str], *, debug: bool=False) -> list[str]:
+    """
+    Find the first '*start*post fees message' ... '*end*post fees message' block,
+    and truncate the text right AFTER that block (i.e., drop everything that follows).
+    If the pair isn't found, returns the original lines unchanged.
+    """
+    n = len(lines)
+    start_i = end_i = None
+
+    for i in range(n):
+        s = (lines[i] or "").strip()
+        if start_i is None:
+            if POST_FEES_START.match(s):
+                start_i = i
+        else:
+            if POST_FEES_END.match(s):
+                end_i = i
+                break
+
+    if start_i is not None and end_i is not None and end_i >= start_i:
+        if debug:
+            print(f"[clip-postfees] found block: start={start_i+1}, end={end_i+1}  → truncating after end")
+        # Keep everything up to and including the end marker, drop the rest
+        return lines[: end_i + 1]
+
+    if debug:
+        why = "no start marker" if start_i is None else "no end marker after start"
+        print(f"[clip-postfees] no truncation ({why})")
+    return lines
+
+date_re        = re.compile(r'^\s*(\d{2}/\d{2})\b')
+amount_only_re = re.compile(r'^\s*([0-9]{1,3}(?:,[0-9]{3})*\.\d{2})\s*$')
+NONBREAKING_SPACES = ("\u00A0", "\u2007", "\u202F")
+def _clean_for_match(s: str) -> str:
+    s = unicodedata.normalize("NFKC", s)
+    for ch in NONBREAKING_SPACES:
+        s = s.replace(ch, " ")
+    return s
+
+# Fallback: “... 000000714245263 $2,315.05 $3,244.86” -> last two amounts on the line
+# (first = beginning, second = ending)
+def _to_float_amt(txt: str) -> float:
+    """Parses $1,234.56 or (1,234.56) or -1,234.56 to float with sign."""
+    s = txt.strip().replace("$", "").replace(",", "")
+    neg = False
+    if s.endswith('-'):
+        neg, s = True, s[:-1]
+    if s.startswith("(") and s.endswith(")"):
+        neg, s = True, s[1:-1]
+    val = float(s)
+    return -val if neg else val
+def parse_begin_end_balances(lines: list[str], *, debug: bool = False) -> tuple[float | None, float | None]:
+    """
+    Returns (begin, end) balances for the CHECKING account on the statement.
+    Priority:
+      1) Exact literal 'Chase Better Banking Checking … <acct> $begin $end'
+      2) Any 'Checking <acct> $begin $end' header line
+      3) Labeled 'Beginning Balance …' / 'Ending (or Closing) Balance …'
+      4) None, None
+    """
+    # 1) Exact literal Checking header you provided...
+    for raw in lines:
+        line = _clean_for_match(raw)
+        m = CHECKING_SPECIFIC_RE.search(line)
+        if m:
+            try:
+                b = _to_float_amt(m.group("begin"))
+                e = _to_float_amt(m.group("end"))
+                if debug:
+                    print(f"[balances:checking-header] {line.strip()} -> begin={b} end={e}")
+                return b, e
+            except Exception:
+                pass # keep looking if parse fails
+    # 2) Generic "Checking <acct> $begin $end" (ignores Savings entirely)
+    for raw in lines:
+        m = CHECKING_GENERIC_RE.search(raw)
+        if m:
+            try:
+                b = _to_float_amt(m.group("begin"))
+                e = _to_float_amt(m.group("end"))
+                return b, e
+            except Exception:
+                pass
+
+    # 3) Labeled lines fallback
+    begin_lbl, end_lbl = None, None
+    for raw in lines:
+        m1 = BEGIN_BAL_RE.search(raw)
+        if m1:
+            begin_lbl = _to_float_amt(m1.group(1))
+        m2 = END_BAL_RE.search(raw)
+        if m2:
+            end_lbl = _to_float_amt(m2.group(2))
+    if begin_lbl is not None and end_lbl is not None:
+        return begin_lbl, end_lbl
+
+    # 4) Give up
+    return None, None
+
+# --- End RegExes
+# --- Statement totals (for reconciliation by side) ---
+# safer, simpler extractor
+
+
+def parse_statement_totals(lines: list[str]) -> tuple[float|None, float|None]:
+    """Return (deposits_total, withdrawals_total) as floats or None if not found."""
+    dep_total: float | None = None
+    wd_total: float | None = None
+    for ln in lines:
+        m = TOT_DEPOSITS_RE.search(ln)
+        if m: dep_total = float(m.group(1).replace(',', ''))
+        m = TOT_WITHDRAWALS_RE.search(ln)
+        if m: wd_total   = float(m.group(1).replace(',', ''))
+    return dep_total, wd_total
+
+# Create Adjustment Record
+def _append_adj(df_in, amt, label):
+    adj_date = pd.to_datetime(df_in["Date"].max())
+    row = {
+        "Date": adj_date,
+        "Description": f"Adjustment: {label} per statement",
+        "Amount": float(amt),
+        "_src": "ADJUST",
+        "Category": "Adjustment",
+    }
+    if "Subcategory" in df_in.columns:
+        row["Subcategory"] = "Statement delta"
+    return pd.concat([df_in, pd.DataFrame([row])], ignore_index=True)
+
+# --- Section headers (be permissive; Chase wording varies) ---
+SECTION_PATTERNS = {
+    "DEPOSITS": re.compile(r"Deposits?\s+(?:&|and)\s+Additions?", re.I),
+    "WITHDRAWALS": re.compile(r"(Electronic|ATM|Debit\s*Card)\s+Withdrawals?", re.I),
+    "CHECKS": re.compile(r"Checks?\s+Paid", re.I),
+    "RETURNS": re.compile(r"(Return?|Returned\s+Items?|Adjustments?)", re.I),
+}
+DEFAULT_INCOME_KEYS = [
+    "ONLINE TRANSFER FROM", "TRANSFER FROM", "DEPOSIT", "PAYROLL",
+    "CHECK DEPOSIT", "ATM CHECK DEPOSIT", "INTEREST PAYMENT", "Direct Dep", 
+    "REFUND", "REVERSAL", "ACH CREDIT", "RETURN", "Pershing"
+]
+# Hints to force sign even if income keywords don't match
+POS_SIGN_HINTS = [
+    "DEPOSIT","ACH CREDIT","CREDIT","PAYROLL","DIRECT DEP",
+    "ZELLE CREDIT","MOBILE DEPOSIT","CHECK DEPOSIT","ATM CHECK DEPOSIT",
+    "RETURN","RETURNS","REFUND","REVERSAL","ADJUSTMENT","PERSHING",
+    "INCOME PMT"  # <= new
+]
+NEG_SIGN_HINTS = [
+    "WITHDRAWAL", "DEBIT", "CARD PURCHASE", "POS PURCHASE",
+    "ACH DEBIT", "ATM WITHDRAWAL", "ONLINE PAYMENT", "PAYMENT",
+    "TRANSFER TO", "AUTOMATIC PAYMENT"
+]
+def is_check_txn(line: str) -> bool:
+    """True only for actual check transactions or the checks header."""
+    if CHECKS_HEADER.match(line):
+        return True
+    if CHECK_NUMBER_INLINE.search(line):
+        return True
+    if CHECK_LINE_RE.match(line):
+        return True
+    if CHECK_LINE_RE1.match(line):
+        return True
+    if CHECK_LINE_ALT.match(line):
+        return True
+    return False
+
+def _norm(s: str) -> str:
+    return (s or '').replace('\u00A0',' ').replace('\u2007',' ').replace('\u202F',' ')\
+                    .replace('\t',' ').rstrip('\r\n')
+
+def _score_depositish(run_lines: list[str]) -> int:
+    dep_kw = [ "DEPOSIT", "CHECK DEPOSIT", "ATM CHECK DEPOSIT", "PAYROLL",
+               "DIRECT DEP", "ACH CREDIT", "CREDIT", "ONLINE TRANSFER FROM",
+               "TRANSFER FROM", "INTEREST PAYMENT" ]
+    neg_kw = [ "CARD PURCHASE", "ATM WITHDRAWAL", "WITHDRAWAL",
+               "ONLINE PAYMENT", "PAYMENT", "TRANSFER TO", "DEBIT" ]
+    s = 0
+    for l in run_lines:
+        u = l.upper()
+        if any(k in u for k in dep_kw): s += 2
+        if any(k in u for k in neg_kw): s -= 2
+    return s
+
+def grab_date_run(lines, start_idx, *, debug=False):
+    out, started = [], False
+    j, N = start_idx + 1, len(lines)
+    while j < N:
+        raw = _norm(lines[j])
+        if debug: print(f"[TRACE] j={j+1} raw={raw!r}")
+
+        # hard stop on next major section header (even pre-run)
+        if MAJOR_STOP.match(raw):
+            if debug:
+                why = "major header after run started" if started else "major header before run started"
+                print(f"   ↳ stop: {why}")
+            break
+
+        # table header
+        if HEADER_ROW.match(raw):
+            if debug: print("   ↳ skip header row")
+            j += 1; continue
+
+        m = DATE_LINE.match(raw)
+        if m:
+            if debug: print(f"   ↳ add date-line (mm={m.group(1)}, dd={m.group(2)})")
+            out.append(raw); started = True; j += 1; continue
+
+        # only let checks end the run *after* we’ve started
+        if is_check_txn(raw):
+            if started:
+                if debug: print("   ↳ stop: checks header/txn after run started")
+                break
+            if debug: print("   ↳ pre-run checks summary; continue")
+            j += 1; continue
+
+        if started:
+            if debug: print("   ↳ stop: non-date after run started")
+            break
+
+        if debug: print("   ↳ pre-run noise; continue")
+        j += 1
+
+    if debug: print(f"[TRACE] collected {len(out)} date-lines in this run")
+    return out
+_HDR_END_THEN_DATE = re.compile(r'(\*end\*[\s\S]*?)\s+(\d{1,2}/\d{2}\b)', re.IGNORECASE)
+
+def _deglue_header_date(seq: list[str]) -> list[str]:
+    """Split lines like '*end*...  MM/DD ...' into two lines; no-ops otherwise."""
+    out = []
+    for ln in seq:
+        m = _HDR_END_THEN_DATE.search(ln)
+        if m:
+            out.append(m.group(1).rstrip())
+            out.append((m.group(2) + ln[m.end(2):]).rstrip())
+        else:
+            out.append(ln)
+    return out
+
+def _count_date_lines(seq: list[str]) -> int:
+    return sum(1 for ln in seq if re.match(r'^\d{1,2}/\d{2}\b', ln))
+
+# New code
+def file_signature(path: Path) -> tuple[str, int, str]:
+    b = path.read_bytes()
+    return (path.name, len(b), hashlib.sha1(b).hexdigest())
+
+def read_ingest_log(wb):
+    name = "Ingest Log"
+    cols = ["When","File","Size","SHA1","Parsed","Added","Workbook"]
+    if name not in wb.sheetnames:
+        ws = wb.create_sheet(name)
+        ws.append(cols)
+        return set(), ws
+    ws = wb[name]
+    seen = set()
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if not row or not row[1]: continue
+        seen.add((row[1], row[2], row[3]))  # (File, Size, SHA1)
+    return seen, ws
+
+def append_ingest_log(ws, dashboard_path: Path, sig, parsed: int, added: int):
+    ws.append([
+        datetime.now().isoformat(timespec="seconds"),
+        sig[0], sig[1], sig[2],
+        int(parsed), int(added),
+        dashboard_path.name
+    ])
+
+def _match_check(line: str):
+    m = CHECK_LINE_RE1.match(line) or CHECK_LINE_RE.match(line) or CHECK_LINE_ALT.match(line)
+    if not m:
+        return None
+    # normalize to (chkno, mmdd, amt_text)
+    grp = m.groupdict()
+    return grp["chkno"], grp["mmdd"], grp["amt"]
+
+def clean_amount(a: str) -> float:
+    s = a.strip()
+    neg = False
+    if s.endswith('-'):
+        neg = True
+        s = s[:-1]
+    if s.startswith('(') and s.endswith(')'):
+        neg = True
+        s = s[1:-1]
+    s = s.replace('$', '').replace(',', '').strip()
+    if s.startswith('-'):
+        neg = True
+        s = s.lstrip('-').strip()
+    val = float(s)
+    return -val if neg else val
+def parse_end_date_from_filename(path: Path):
+    """Extract end_year and end_month from filename like 20190107-...pdf/raw."""
+    m = re.search(r"(20\d{2})(\d{2})(\d{2})", path.stem)
+    if not m:
+        return 2018, 12
+    y, mth, _ = m.groups()
+    return int(y), int(mth)
+
+def assign_year(end_year: int, end_month: int, txn_month: int):
+    """
+    Assign transaction year based on statement end date.
+    Handles normal overlaps (end_month and end_month-1) and December→January year change.
+    """
+    if txn_month == end_month:
+        return end_year
+    if txn_month == ((end_month - 1) if end_month > 1 else 12):
+        # Prior month of statement
+        if end_month == 1 and txn_month == 12:
+            return end_year - 1
+        return end_year
+    # Fallback: assume end_year
+    return end_year
+
+def load_rules(csv_path: Path):
+    rules = []
+    if not csv_path or not csv_path.exists():
+        return rules
+    df = pd.read_csv(csv_path)
+    for _, r in df.iterrows():
+        rules.append({
+            "keyword": str(r.get("keyword","")),
+            "category": str(r.get("category","Other")) or "Other",
+            "match_type": str(r.get("match_type","contains")).lower(),
+            "case_sensitive": bool(r.get("case_sensitive", False))
+        })
+    return rules
+
+def categorize_default(description: str) -> str:
+    u = (description or "").upper()
+    if u.startswith("CHECK #"): return "Checks"
+    if "WAL-MART" in u or "WALMART" in u: return "Groceries"
+    if u.startswith("TST*"): return "Food & drink"
+    if "PERSHING" in u: return "401K transfer"
+    if "ONLINE PAYMENT" in u: return "Online payment"
+    if "HOME DEPOT" in u or "LOWES" in u: return "Home Repair"
+    if "GOLF" in u: return "Golf"
+    if "WELLCARE" in u or "CHIROPRACT" in u: return "Health & wellness"
+    if "KERA" in u: return "Donations"
+    if any(x in u for x in ["City of Plano","Solar","ATMOS"]): return "Utility"
+    if any(x in u for x in ["Allstate","Northwestern Mutual Isa","Unitedhealthone Ins"]): return "Insurance"
+    if any(x in u for x in ["KROGER","TRADER JOE","TOM THUMB","CENTRAL MARKET","MARKET STREET","WHOLEFDS","GROC"]): return "Groceries"
+    if any(x in u for x in ["QUIKTRIP","SHELL","EXXON","FUEL","GAS"]): return "Gas"
+    if any(x in u for x in ["J. JILL","DSW","KOHL","MARSHALLS","REI","ANTHROPOLOGIE","BEDBATH"]): return "Shopping"
+    if any(x in u for x in ["DELI","PANERA","FISH AND FIZZ","CAFETERI","SCOTTY P","BREAD ZEPPELIN","MCAF","JASON'S","CAFE"]): return "Food & drink"
+    if any(x in u for x in ["NETFLIX","MUSEUM","ARBOR"]): return "Entertainment"
+    return "Other"
+# --- Deposit subcategory mapping ---
+DEPOSIT_SUBCATS = [
+    ("Return",        [r"\bREFUND\b", r"\bRETURN\b", r"\bREVERSAL\b", r"\bADJUSTMENT\b"]),  # put first so it wins ties
+    ("Payroll",       [r"\bPAYROLL\b", r"\bDIRECT\s+DEP\b", r"\bINCOME\s+PMT\b", r"\bADP\b", r"\bOASISBATCH\b", r"\bNEW\s+YORK\s+LIFE\s+PAYROLL\b"]),
+    ("Transfer In",   [r"\bONLINE\s+TRANSFER\s+FROM\b", r"\bTRANSFER\s+FROM\b", r"\bFROM\s+SAV\b", r"\bPERSHING\b"]),
+    ("Check Deposit", [r"(?:ATM|MOBILE)?\s*CHECK\s+DEPOSIT"]),
+    ("Interest",      [r"\bINTEREST\s+PAYMENT\b"]),
+]
+
+def categorize_deposit(desc: str) -> str:
+    u = (desc or "").upper()
+    for name, patterns in DEPOSIT_SUBCATS:
+        for pat in patterns:
+            if re.search(pat, u):
+                return name
+    return "Deposit"  # fallback
+
+def apply_rules(description: str, rules):
+    if not rules: return None
+    text_cs = description or ""
+    text_uc = text_cs.upper()
+    for rule in rules:
+        kw = rule["keyword"]
+        hay = text_cs if rule["case_sensitive"] else text_uc
+        needle = kw if rule["case_sensitive"] else kw.upper()
+        mt = rule["match_type"]
+        try:
+            if mt == "contains" and needle in hay: return rule["category"]
+            if mt == "startswith" and hay.startswith(needle): return rule["category"]
+            if mt == "regex" and re.search(kw, text_cs): return rule["category"]
+        except Exception:
+            continue
+    return None
+
+def _norm_marker(name: str) -> str:
+    s = (name or "").lower().strip()
+    s = re.sub(r"\s*section\d+\b", "", s)
+    s = s.replace("\u00A0"," ").replace("\u2007"," ").replace("\u202F"," ")
+    s = re.sub(r"[&\-\s]+", "", s)
+    s = re.sub(r"withdrawals\b", "withdrawal", s)
+    return s
+
+def parse_by_startend_markers(lines: list[str], *, debug=False) -> list[str]:
+    marker_re = re.compile(r"^\*+(?:start|end)\*+(.+)$", re.I)
+
+    # 1) Which sections appear anywhere on these pages?
+    want_present = set()
+    for raw in lines:
+        m = marker_re.match((raw or "").strip())
+        if m:
+            want_present.add(_norm_marker(m.group(1)))
+
+    WANT = {
+        "depositsandadditions",
+        "checkspaid",
+        "atmdebitwithdrawal",
+        "electronicwithdrawal",
+    }
+    want_present &= WANT  # limit to the sections we care about
+
+    if not want_present:
+        if debug: print("[markers] none of our target sections present; fail-open")
+        return lines
+
+    # 2) Slice by real headers (continuations included) and keep wanted ones
+    HDRS = [
+    (re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I), "depositsandadditions"),
+    (re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),                       "checkspaid"),
+    (re.compile(r'^\s*CHECK\s*NO\.\s*DESCRIPTION\b', re.I),           "checkspaid"),  # <- new alt header
+    (re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I), "atmdebitwithdrawal"),
+    (re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),            "electronicwithdrawal"),
+    ]
+
+    MAJOR_STOP = re.compile(
+        r"^(?:\s*)(?:CHECKING\s+SUMMARY|CHECK\s+NO\.\s+DESCRIPTION|"
+        r"CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"
+        r"ELECTRONIC\s+WITHDRAWALS?|DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?))\b",
+        re.I
+    )
+
+    kept, i, N = [], 0, len(lines)
+    while i < N:
+        hit = None
+        for rx, key in HDRS:
+            if rx.search(lines[i] or ""):
+                hit = (rx, key, i)
+                break
+        if not hit:
+            i += 1
+            continue
+
+        rx, key, start = hit
+        j = start + 1
+        while j < N and not MAJOR_STOP.match(lines[j] or ""):
+            j += 1
+
+        if key in want_present:
+            kept.extend(lines[start:j])
+
+        i = j
+
+    if debug: print(f"[markers] kept {len(kept) or len(lines)} lines (header-sliced)")
+    return kept or lines  # fail-open
+
+# --- Single-pass stream parser (deposits → checks → atm → electronic) ---
+MAJOR_BREAK = re.compile(r'^\s*(TRANSACTION\s+DETAIL|DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE)\b', re.I)
+
+def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=False):
+    """
+    Header-driven parse. Handles wrapped amounts and 3-line cash-back pattern.
+    Sections:
+      0 = Deposits & Additions, 1 = Checks, 2 = ATM & Debit, 3 = Electronic
+    """
+    out = []  # (Date, Description, Amount, _src)
+    N = len(lines)
+
+    # Section index & state
+    sec_idx = -1
+    gap_after_atm = False  # when we see a non-date line inside ATM, the next date line becomes Electronic
+
+    def norm(s: str) -> str:
+        return (s or "").replace("\u00A0"," ").replace("\u2007"," ").replace("\u202F"," ")\
+                        .replace("\t"," ").rstrip("\r\n")
+    sec = -1           # -1 unknown, 0=Deposits, 1=Checks, 2=ATM, 3=Electronic
+    saw_elec_header = False
+
+    i = 0
+    while i < N:
+        raw = lines[i]
+        line = norm(raw)
+        if not line:
+            i += 1; continue
+
+        # Skip Savings-looking content anywhere
+        if is_savings_like(line) or re.search(r'^\s*(?:CHASE\s+SAVINGS|SAVINGS\s+SUMMARY)\s*$', line, re.I):
+            i += 1; continue
+        if re.search(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', line, re.I):
+            # Savings table header: skip rows until next major header; do not change 'sec'
+            i += 1
+            while i < N and not (MAJOR_STOP.match(norm(lines[i])) or ELEC_WITH_HDR.search(norm(lines[i]))):
+                i += 1
+            continue
+
+        # Explicit section headers
+        if (DEP_ADD_HDR.search(line) or re.search(r"\bDEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b", line, re.I)) and not AMT_RE.search(line):
+            sec = 0; i += 1; 
+            if debug: print(f"-> header: DEPOSITS at {i}")
+            continue
+        if (CHECKS_HEADER.search(line) or re.search(r"\bCHECKS?\s+PAID\b", line, re.I)) and not AMT_RE.search(line):
+            sec = 1; i += 1;
+            if debug: print(f"-> header: CHECKS at {i}")
+            continue
+        if ATM_DEBIT_HDR.search(line) and not AMT_RE.search(line):
+            sec = 2; i += 1;
+            if debug: print(f"-> header: ATM/DEBIT at {i}")
+            continue
+        if ELEC_WITH_HDR.search(line) and not AMT_RE.search(line):
+            sec = 3; saw_elec_header = True; i += 1;
+            if debug: print(f"-> header: ELECTRONIC at {i}")
+            continue
+
+        # --- Check-number-first rows (existing code, unchanged) ---
+        mchk = CHECK_LINE_RE1.match(line) or CHECK_LINE_RE.match(line) or CHECK_LINE_ALT.match(line)
+        if mchk:
+            mm, dd = map(int, re.split(r'[/-]', mchk.group('mmdd')))
+            year   = assign_year(end_year, end_month, mm)
+            amt    = clean_amount(mchk.group('amt'))
+            desc   = (f"Check # {mchk.group('chkno')}" if not CHECK_LINE_ALT.match(line)
+                      else f"Check # {mchk.group('chkno')} {CHECK_LINE_ALT.match(line).group('mid').strip()} {mchk.group('mmdd')}")
+            out.append((f"{year:04d}/{mm:02d}/{dd:02d}", desc, -abs(amt), "CHECKS"))
+            i += 1; continue
+
+        # Ignore headers / subtotals
+        if SUBTOTAL_RE.search(line) or HEADER_RE.search(line):
+            i += 1; continue
+
+        # --- Date-led transactions (core) ---
+        mdate = DATE_LINE.match(line)
+        if mdate:
+            mm, dd = int(mdate.group(1)), int(mdate.group(2))
+            year   = assign_year(end_year, end_month, mm)
+
+            # Savings guard again (if two amounts are on the same line)
+            if sum(1 for _ in AMT_RE.finditer(line)) >= 2:
+                i += 1; continue
+
+            # Find amount (same as your existing logic)
+            amatches = list(AMT_RE.finditer(line))
+            amt, desc, looked, use_look = None, "", False, 0
+            if not amatches:
+                # (your existing 3-line cash-back and wrapped-amount logic)
+                # ... keep your current block here unchanged ...
+                pass
+            else:
+                a_span = amatches[-1].span(1)
+                amt    = clean_amount(line[a_span[0]:a_span[1]])
+                desc   = line[mdate.end():a_span[0]].strip()
+
+            if amt is None:
+                i += 1; continue
+
+            # --- State/heuristic transition: ATM → Electronic ---
+            if sec == 2 and not saw_elec_header:
+                guess = classify_withdrawal_line(desc)
+                if guess == "ELEC":
+                    sec = 3
+                elif guess == "ATM":
+                    sec = 2
+                else:
+                    # ambiguous: prefer Electronic after ATM if keywords absent
+                    sec = 3
+
+            # Default section if unknown
+            if sec == -1:
+                # Before any headers, use keywords to decide (+ favor deposits if positive)
+                if amt >= 0:
+                    sec = 0
+                else:
+                    sec = 3 if classify_withdrawal_line(desc) == "ELEC" else 2
+
+            # Sign and _src by section
+            if sec in (-1, 0):
+                signed, src_tag = abs(amt), "DEP_ADD"
+            elif sec == 1:
+                signed, src_tag = -abs(amt), "CHECKS"
+            elif sec == 2:
+                signed, src_tag = -abs(amt), "ATM"
+            else:
+                signed, src_tag = -abs(amt), "ELEC"
+
+            out.append((f"{year:04d}/{mm:02d}/{dd:02d}", desc, signed, src_tag))
+            i += max(1, use_look + 1)
+            continue
+
+        i += 1
+
+
+    return out
+
+# End Parse_records
+
+def read_sheet_df(wb, name):
+    if name in wb.sheetnames:
+        ws = wb[name]
+        if ws.max_row < 1:
+            return pd.DataFrame(columns=["Date","Description","Category","Amount","Source"])
+        cols = [c.value for c in ws[1]]
+        rows = [r for r in ws.iter_rows(min_row=2, values_only=True)] if ws.max_row >= 2 else []
+        df = pd.DataFrame(rows, columns=cols)
+
+        # Normalize expected columns & dtypes
+        if "Date" in df.columns:
+            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        for col in ["Description","Category","Amount","Source"]:
+            if col not in df.columns:
+                df[col] = "" if col != "Amount" else 0.0
+
+        # Keep a stable column order but allow extras
+        base = ["Date","Description","Category","Amount","Source"]
+        tail = [c for c in df.columns if c not in base]
+        return df[base + tail].dropna(subset=["Date"]).reset_index(drop=True)
+
+    return pd.DataFrame(columns=["Date","Description","Category","Amount","Source"])
+def apply_source_banding(ws):
+    # find the Source column index
+    header = [c.value for c in ws[1]]
+    if "Source" not in header:
+        return
+    src_col = header.index("Source") + 1
+
+    # paint each row based on Source value
+    for r in range(2, ws.max_row + 1):
+        val = ws.cell(row=r, column=src_col).value
+        fill = SRC_FILLS.get(str(val), None)
+        if not fill:
+            continue
+        for c in range(1, ws.max_column + 1):
+            ws.cell(row=r, column=c).fill = fill
+def write_df(ws, df):
+    ws.delete_rows(1, ws.max_row)
+    # Write header exactly as provided by df
+    ws.append(list(df.columns))
+    for c in ws[1]:
+        c.font = Font(bold=True)
+
+    # Write rows
+    for r in dataframe_to_rows(df, index=False, header=False):
+        ws.append(r)
+
+    # Try to format Date column if present
+    cols = list(df.columns)
+    if "Date" in cols:
+        col_idx = cols.index("Date") + 1  # 1-based
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                cell.number_format = "yyyy/mm/dd"
+
+    # Basic widths
+    # Date | Description | Category | Amount | Source (if present)
+    for name, width in [("Date",12), ("Description",70), ("Category",18), ("Amount",12), ("Source",24)]:
+        if name in cols:
+            ws.column_dimensions[get_column_letter(cols.index(name)+1)].width = width
+
+
+def merge_dedup(old, new):
+    if (old is None or getattr(old, "empty", True)) and (new is None or getattr(new, "empty", True)):
+        cols = ["Date","Description","Category","Amount","Source"]
+        return pd.DataFrame(columns=cols).astype({"Amount":"float64"})
+
+    comb = new.copy() if (old is None or getattr(old, "empty", True)) else (
+           old.copy() if (new is None or getattr(new, "empty", True)) else
+           pd.concat([old, new], ignore_index=True))
+
+    if "Date" in comb.columns:
+        comb["Date"] = pd.to_datetime(comb["Date"], errors="coerce")
+    comb["Description"] = comb.get("Description","").astype(str)
+    if "Category" not in comb.columns: comb["Category"] = ""
+    comb["Category"] = comb["Category"].astype(str)
+    comb["Amount"] = pd.to_numeric(comb["Amount"], errors="coerce")
+
+    has_seq = "_seq" in comb.columns
+
+    key = comb["Date"].dt.strftime("%Y-%m-%d")
+    key = key.str.cat(comb["Description"], sep="||")
+    key = key.str.cat(comb["Amount"].round(2).astype(str), sep="||")
+    if "Source" in comb.columns:
+        key = key.str.cat(comb["Source"].astype(str), sep="||")
+    if has_seq:
+        key = key.str.cat(comb["_seq"].astype(str), sep="||")
+    comb["dupe_key"] = key
+
+    comb = comb.drop_duplicates(subset=["dupe_key"]).drop(columns=["dupe_key"], errors="ignore")
+    comb = comb.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    return comb
+
+
+
+# --- Build Monthly & Yearly summaries with safe TOTAL rows ---
+def build_summaries_with_totals(stack: pd.DataFrame):
+    # Handle empty stack gracefully
+    if stack is None or stack.empty:
+        monthly_summary = pd.DataFrame(columns=["Month", "Category", "Amount"])
+        yearly_summary  = pd.DataFrame(columns=["Year", "Category", "Amount"])
+        return monthly_summary, yearly_summary
+
+    s = stack.copy()
+    s["Year"]  = s["Date"].dt.year
+    s["Month"] = s["Date"].dt.to_period("M").astype(str)
+
+    # Base summaries
+    monthly_summary = s.groupby(["Month", "Category"], as_index=False)["Amount"].sum()
+    yearly_summary  = s.groupby(["Year",  "Category"], as_index=False)["Amount"].sum()
+
+    # Monthly TOTAL rows
+    _month_totals = (
+        s.groupby("Month", as_index=False)["Amount"].sum()
+         .assign(Category="TOTAL")[["Month", "Category", "Amount"]]
+    )
+    monthly_summary = pd.concat([monthly_summary, _month_totals], ignore_index=True)
+    monthly_summary["_msort"] = pd.PeriodIndex(monthly_summary["Month"], freq="M")
+    monthly_summary["_csort"] = (monthly_summary["Category"] == "TOTAL").astype(int)
+    monthly_summary = (monthly_summary
+                       .sort_values(["_msort", "_csort", "Category"])
+                       .drop(columns=["_msort", "_csort"])
+                       .reset_index(drop=True))
+
+    # Yearly TOTAL rows
+    _year_totals = (
+        s.groupby("Year", as_index=False)["Amount"].sum()
+         .assign(Category="TOTAL")[["Year", "Category", "Amount"]]
+    )
+    yearly_summary = pd.concat([yearly_summary, _year_totals], ignore_index=True)
+    yearly_summary["_csort"] = (yearly_summary["Category"] == "TOTAL").astype(int)
+    yearly_summary = (yearly_summary
+                      .sort_values(["Year", "_csort", "Category"])
+                      .drop(columns=["_csort"])
+                      .reset_index(drop=True))
+
+    return monthly_summary, yearly_summary
+
+def rebuild_sheet(wb, name, df_in):
+    if name in wb.sheetnames:
+        ws = wb[name]; ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(name)
+    ws.append(list(df_in.columns))
+    for c in ws[1]: c.font = Font(bold=True)
+    for r in dataframe_to_rows(df_in, index=False, header=False):
+        ws.append(r)
+def upsert_summary_sheet(wb, name: str, new_df: pd.DataFrame, key_col: str):
+    """
+    Upsert summary rows on 'key_col' (Month or Year):
+      - If sheet exists, drop old rows whose key is present in new_df[key_col],
+        then append new_df and rewrite the sheet.
+      - If not, just write new_df.
+    """
+    # Normalize incoming columns order
+    cols = list(new_df.columns)
+
+    if name in wb.sheetnames and wb[name].max_row >= 2:
+        ws = wb[name]
+        old_cols = [c.value for c in ws[1]]
+        rows = [r for r in ws.iter_rows(min_row=2, values_only=True)]
+        old_df = pd.DataFrame(rows, columns=old_cols)
+
+        # Align columns if older sheet has extras/missing
+        for c in cols:
+            if c not in old_df.columns:
+                old_df[c] = pd.NA
+        old_df = old_df[cols]
+
+        # Remove keys we’re replacing this run
+        repl_keys = set(new_df[key_col].astype(str).unique())
+        keep_old = ~old_df[key_col].astype(str).isin(repl_keys)
+        combined = pd.concat([old_df[keep_old], new_df], ignore_index=True)
+
+    else:
+        combined = new_df.copy()
+
+    rebuild_sheet(wb, name, combined)
+
+def clip_to_checking_lines(lines, *, debug: bool=False):
+    ELEC_WITH_HDR     = re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I)
+    MAJOR_STOP        = re.compile(
+        r'^(?:\s*)(?:CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|'
+        r'ELECTRONIC\s+WITHDRAWALS?|DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)|CHECKING\s+SUMMARY)\b',
+        re.I
+    )
+    SAVINGS_BANNER    = re.compile(r'^\s*(?:CHASE\s+SAVINGS|SAVINGS\s+SUMMARY)\s*$', re.I)
+    SAVINGS_TABLEHDR  = re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', re.I)
+    DATE_HEAD         = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])\b')
+
+    kept = []
+    skipping_savings = False
+
+    for i, raw in enumerate(lines):
+        s = (raw or "").strip()
+
+        # Enter/leave a Savings "skip" zone
+        if SAVINGS_BANNER.search(s) or SAVINGS_TABLEHDR.search(s):
+            skipping_savings = True
+            if debug: print(f"[clip2] enter Savings-skip at line {i+1}: {s!r}")
+            continue
+
+        # Savings detail signature: a date-led row with TWO money amounts on the same line
+        if DATE_HEAD.match(s) and sum(1 for _ in AMT_RE.finditer(s)) >= 2:
+            skipping_savings = True
+            if debug: print(f"[clip2] Savings-style row skipped at {i+1}: {s!r}")
+            continue
+
+        # Leave Savings-skip when we hit any major top-level header (incl. ELECTRONIC)
+        if skipping_savings and (MAJOR_STOP.search(s) or ELEC_WITH_HDR.search(s)):
+            skipping_savings = False
+            if debug: print(f"[clip2] exit Savings-skip at line {i+1}: {s!r}")
+
+        if skipping_savings:
+            continue
+
+        kept.append(raw)
+
+    if debug:
+        print(f"[clip2] Keeping {len(kept)} of {len(lines)} lines (Checking-only slice).")
+    return kept
+
+
+def write_about_sheet(wb, dashboard_path):
+    name = "About"
+    if name in wb.sheetnames:
+        ws = wb[name]
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(name, 0)  # put it first
+
+    rows = [
+        ["Field", "Value"],
+        ["Tool", dashboard_path.name],
+        ["Version", build_version_string()],
+        ["Generated", datetime.now().isoformat(timespec="seconds")],
+    ]
+    for r in rows:
+        ws.append(r)
+    # Bold header
+    for c in ws[1]:
+        try:
+            c.font = Font(bold=True)
+        except Exception:
+            pass
+def _balances_from_account_line(raw_lines):
+    import re
+    pat = re.compile(
+        r"Chase\s+Better\s+Banking\s+Checking\s+\d{6,}\s+\$([0-9,]+\.[0-9]{2})\s+\$([0-9,]+\.[0-9]{2})",
+        re.IGNORECASE
+    )
+    for s in raw_lines:
+        m = pat.search(s)
+        if m:
+            def _f(x): return float(x.replace(",",""))
+            return _f(m.group(1)), _f(m.group(2))
+    return (None, None)
+# --- helpers ---------------------------------------------------------------
+def _src(final_value, *tagged_candidates):
+    """
+    Return the name of the first candidate whose value equals final_value.
+    Usage: _src(begin_bal, ("pageclip", b2), ("acctline", begin_fallback), ("pdf", totals.get("begin")))
+    """
+    for tag, candidate in tagged_candidates:
+        if candidate is not None and final_value == candidate:
+            return tag
+    return "pre-existing"
+def write_color_legend(wb):
+    name = "Legend"
+    if name in wb.sheetnames:
+        ws = wb[name]
+        ws.delete_rows(1, ws.max_row)
+    else:
+        ws = wb.create_sheet(name, index=1)
+
+    # Header
+    ws.append(["Source", "Color (hex)", "Meaning"])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+
+    palette = {
+        "Deposits": ("E6F4EA", "Deposit section"),
+        "Checks": ("FDE7E9", "Checks Paid section"),
+        "ATM & Debit Withdrawals": ("FFF4E5", "ATM & card transactions"),
+        "Electronic Withdrawals": ("E8F0FE", "ACH/online payments"),
+        "Adjustment": ("F3E8FD", "Synthetic balance adjustment"),
+    }
+
+    row = 2
+    for src, (hexcol, note) in palette.items():
+        ws.append([src, f"#{hexcol}", note])
+        # fill only the first column cell; don't touch others
+        ws.cell(row=row, column=1).fill = PatternFill(patternType="solid", fgColor=hexcol)
+        row += 1
+
+    # Optional: widths
+    ws.column_dimensions["A"].width = 28
+    ws.column_dimensions["B"].width = 14
+    ws.column_dimensions["C"].width = 36
+
+def resolve_rules_path(args) -> Path | None:
+    """
+    Resolution order when --rules not specified or points to a non-existent file:
+      1) <dashboard_dir>/category_rules.csv
+      2) <input_dir>/../category_rules.csv   (i.e., Budget root if input is in History_text)
+      3) <script_dir>/category_rules.csv
+    If args.rules is provided and exists, use it as-is.
+    Returns a Path or None if nothing found.
+    """
+    # If user specified --rules and it exists, use it
+    if getattr(args, "rules", None):
+        p = Path(args.rules)
+        if p.exists():
+            return p
+
+    # Candidates
+    dash_dir   = Path(args.dashboard).parent
+    input_dir  = Path(args.input).parent
+    script_dir = Path(__file__).parent
+
+    candidates = [
+        dash_dir / "category_rules.csv",
+        input_dir.parent / "category_rules.csv",  # Budget root (parent of History_text)
+        script_dir / "category_rules.csv",
+    ]
+    for c in candidates:
+        if c.exists():
+            return c
+
+    return None
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("input", help="PDF or raw text file; if PDF, pdftotext -raw runs automatically")
+    ap.add_argument("--dashboard", default="Chase_Budget_Dashboard.xlsx", help="Excel dashboard to update")
+    ap.add_argument("--rules", default=None, help="Path to category rules CSV")
+    ap.add_argument("--debug", action="store_true", help="Verbose debug tracing")
+    ap.add_argument("--force", action="store_true", help="Re-ingest even if this exact file was logged before")
+    ap.add_argument("--reset-dashboard", action="store_true")
+    ap.add_argument("--dashboard-template", default="templates/Chase_Budget_Dashboard.xlsx")
+    ap.add_argument("--audit", action="store_true",
+                help="Write reconciliation audit workbook next to the dashboard")
+    ap.add_argument("--audit-path", default=None)
+    ap.add_argument("--auto-adjust", action="store_true",
+                help="Add 'Adjustment' txn(s) so parsed totals match statement totals")
+    ap.add_argument("--adjust-threshold", type=float, default=0.02,
+                help="Only add an adjustment if absolute delta >= this amount")
+    ap.add_argument("--pdf", default=None, help="Path to the source statement PDF for verification")
+    ap.add_argument("--verify-pdf", action="store_true", help="Verify parsed rows against the PDF (requires --pdf)")
+    ap.add_argument(
+    "--version",
+    action="version",
+    version="%(prog)s " + build_version_string())
+    args = ap.parse_args()
+    if getattr(args, "debug", False):
+        print("[version]", build_version_string())
+    input_path     = Path(args.input)
+    dashboard_path = Path(args.dashboard)
+    rules_path = resolve_rules_path(args)
+    if args.debug:
+        print(f"[rules] using: {rules_path if rules_path else 'None (built-ins only)'}")
+    # --- If the input is a PDF, convert it to text first ---
+    if input_path.suffix.lower() == ".pdf":
+        pdf_path = input_path
+
+        # Choose output dir: prefer sibling/History_text if it exists, else same dir.
+        preferred_dir = pdf_path.parent.with_name("History_text")
+        out_dir = preferred_dir if preferred_dir.exists() else pdf_path.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Clean filename: drop trailing dashes/underscores and “-statements”
+        clean_stem = pdf_path.stem.replace("-statements-5263", "").rstrip("-_")
+        txt_name = f"{clean_stem}-raw.txt"
+        txt_path = out_dir / txt_name
+
+        PDFTOTEXT_EXE = r"C:\Program Files\xpdf-tools\bin64\pdftotext.exe"
+        try:
+            subprocess.run(
+                [PDFTOTEXT_EXE, "-raw", str(pdf_path), str(txt_path)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if args.debug:
+                print(f"[pdftotext] Extracted raw text → {txt_path}")
+        except Exception as e:
+            print(f"[pdftotext] ERROR running pdftotext: {e}")
+            sys.exit(1)
+
+        # Treat this as though the user had given --pdf and --verify-pdf
+        args.pdf = str(pdf_path)
+        args.verify_pdf = True
+
+        # Now point input_path to the generated text so downstream code parses that
+        input_path = txt_path
+
+
+    # Open or create workbook
+    if args.reset_dashboard:
+        src = Path(args.dashboard_template)
+        dst = Path(args.dashboard)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, dst)
+        print(f"[reset] copied template → {dst}")
+    wb = load_workbook(dashboard_path) if dashboard_path.exists() else Workbook()
+    if "Sheet" in wb.sheetnames and len(wb.sheetnames) == 1 and wb.active.max_row <= 1:
+        wb.remove(wb.active)
+    write_about_sheet(wb, dashboard_path)
+
+    # Ingest log (initialize first)
+    seen, log_ws = read_ingest_log(wb)
+
+    # Duplicate guard
+    sig = file_signature(input_path)
+    if not args.force and sig in seen:
+        print(f"Skip: {sig[0]} already ingested (size={sig[1]}, sha1={sig[2][:10]}…).")
+        return
+
+    # Read raw statement text
+    # --- read & normalize the raw text BEFORE any clipping ---
+    raw_txt = input_path.read_text(encoding="utf-8", errors="ignore")
+    # normalize unicode (helps with odd spaces) and treat form feeds as newlines
+    raw_txt = unicodedata.normalize("NFKC", raw_txt).replace("\r", "").replace("\x0c", "\n")
+    raw_lines = raw_txt.split("\n")
+    
+    lines = input_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    
+    # 1) Coarse page-level clip (existing behavior)
+    if args.pdf:
+        lines = pdf_clip_checking_pages(args.pdf, lines, debug=args.debug)
+    else:
+        lines = clip_after_post_fees_block(lines, debug=args.debug)
+
+    def _count_date_lines(seq):
+        return sum(1 for ln in seq if re.match(r'^\d{1,2}/\d{2}\b', ln))
+    
+    # ---- the intra-page clip block ----
+    pageclip_lines = lines[:]  # keep a fallback snapshot
+    # Decide if the band result looks "healthy" (roughly enough date-led rows)
+    band_lines = parse_by_startend_markers(lines, debug=args.debug)
+    orig_dates = _count_date_lines(pageclip_lines) or _count_date_lines(lines)
+    band_dates = _count_date_lines(band_lines) if band_lines else 0
+    healthy = bool(band_lines) and (band_dates >= max(5, int(0.5 * (orig_dates or 0))))
+    def strip_savings_tables(raw_lines: list[str]) -> list[str]:
+        SAVINGS_BANNER   = re.compile(r'^\s*(?:CHASE\s+SAVINGS|SAVINGS\s+SUMMARY)\s*$', re.I)
+        SAVINGS_TABLEHDR = re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', re.I)
+        ELEC_HDR         = re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I)
+        ELEC_TOTAL_LINE  = re.compile(r'^\s*Total\s+Electronic\s+Withdrawals\b', re.I)
+        MAJOR_STOP       = re.compile(
+            r'^(?:\s*)(?:CHECKING\s+SUMMARY|CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|'
+            r'ELECTRONIC\s+WITHDRAWALS?|DEPOSITS?\b.*\b(?:ADDITIONS?|CREDITS?))\b',
+            re.I
+        )
+        DATE_HEAD        = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])\b')
+
+        out, skip, seen_savings_banner = [], False, False
+
+        for s in raw_lines:
+            t = (s or "").strip()
+
+            # Note we've seen an explicit Savings banner
+            if SAVINGS_BANNER.search(t):
+                seen_savings_banner = True
+                # don't output the banner itself
+                continue
+
+            # Only begin skipping a Savings table if we've already seen a Savings banner.
+            if not skip and seen_savings_banner and SAVINGS_TABLEHDR.search(t):
+                skip = True
+                continue
+
+            if skip:
+                # If we see Electronic section cues while skipping, stop skipping immediately.
+                if ELEC_HDR.search(t) or ELEC_TOTAL_LINE.search(t) or MAJOR_STOP.match(t):
+                    skip = False
+                else:
+                    # Be forgiving: if the “skipped” area suddenly shows a checking-style date line
+                    # with only ONE amount (i.e., not a Savings row), stop skipping and keep it.
+                    if DATE_HEAD.match(t) and sum(1 for _ in AMT_RE.finditer(t)) < 2:
+                        skip = False
+                    else:
+                        continue  # still in Savings table; drop this line
+
+            out.append(s)
+
+        return out
+
+
+    if args.debug:
+        print(f"[pdf-band] date-lines: band={band_dates} vs orig={orig_dates} -> healthy={healthy}")
+
+    if healthy:
+        if args.debug:
+            print(f"[pdf-band] Replacing lines with Checking-band-only text "
+                f"({len(band_lines)} lines vs {len(lines)} original-after-page-clip).")
+        lines = _deglue_header_date(band_lines)
+    else:
+        if args.debug:
+            print("[pdf-band] Band result looks too small or empty; keeping page-clip lines.")
+        lines = _deglue_header_date(pageclip_lines)
+
+    # Optional: write what we will actually parse
+    if args.debug:
+        Path("debug_band_lines.txt").write_text("\n".join(lines), encoding="utf-8")
+        print("[pdf-band] wrote debug_band_lines.txt for inspection")
+    # Establish Begin and End balances from raw_lines
+    begin_bal: float | None = None
+    end_bal:   float | None = None
+
+    # Prefer raw_lines so clipping can’t hide the header row
+    b_hdr, e_hdr = parse_begin_end_balances(raw_lines, debug=getattr(args, "debug", False))
+    if b_hdr is not None: begin_bal = b_hdr
+    if e_hdr is not None: end_bal   = e_hdr
+
+    # 3) Keep the text-only guard as a final safety net
+    # Final text-only safety: drop any Savings tables that slipped through
+    lines = strip_savings_tables(lines)
+    # ✅ Only use the text-only guard if we didn’t already extract a healthy band
+    if not args.pdf or not healthy:
+        checking_lines = clip_to_checking_lines(lines, debug=args.debug)
+    else:
+        checking_lines = lines[:]  # PDF band already provided clean checking slice  
+    def _has_txn_header(seq):
+        H = [
+            re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I),
+            re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),
+            re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I),
+            re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),
+            re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\b', re.I),
+        ]
+        return any(rx.search(s or "") for s in seq for rx in H)
+
+    if checking_lines and _has_txn_header(checking_lines):
+        lines = checking_lines[:]
+        if args.debug: print(f"[clip2] using checking_lines ({len(lines)} rows)")
+    else:
+        if args.debug:
+            why = "empty" if not checking_lines else "no headers in checking_lines"
+            print(f"[clip2] fallback to pre-checking slice because {why}")
+
+    # ✅ From here on, parse only the checking slice
+    lines = checking_lines[:] if checking_lines else lines
+    if args.debug:
+        Path("debug_band_lines.txt").write_text("\n".join(lines), encoding="utf-8")
+        print("[pdf-band] wrote debug_band_lines.txt (POST-CLIP) for inspection")
+
+    # Parse balances & statement end date
+    # Parse balances & statement end date (DON’T overwrite if we already have them)
+    b_hdr2, e_hdr2 = parse_begin_end_balances(lines, debug=getattr(args, "debug", False))
+    if begin_bal is None and b_hdr2 is not None: begin_bal = b_hdr2
+    if end_bal   is None and e_hdr2 is not None: end_bal   = e_hdr2
+    end_year, end_month = parse_end_date_from_filename(input_path)
+# --- define candidates up-front so they always exist in this scope ---
+    b2: float | None = None
+    e2: float | None = None
+    begin_fallback: float | None = None
+    end_fallback: float | None = None
+    totals: dict = {}
+
+    # --- compute candidates (some may stay None) ---
+    if begin_bal is None or end_bal is None:
+        b2, e2 = parse_begin_end_balances(checking_lines)
+
+    begin_fallback, end_fallback = _balances_from_account_line(checking_lines)
+    totals = {}
+    if (begin_bal is None or end_bal is None) and getattr(args, "pdf", None):
+        totals = parse_pdf_totals(args.pdf) or {}
+
+    # --- coalesce ---
+    if begin_bal is None:
+        if b2 is not None:
+            begin_bal = b2
+        elif begin_fallback is not None:
+            begin_bal = begin_fallback
+        elif totals.get("begin") is not None:
+            begin_bal = totals["begin"]
+
+    if end_bal is None:
+        if e2 is not None:
+            end_bal = e2              # <- not "=- e2"
+        elif end_fallback is not None:
+            end_bal = end_fallback
+        elif totals.get("end") is not None:
+            end_bal = totals["end"]
+
+    # --- debug (now safely reachable and all names are defined) ---
+    begin_src = _src(
+        begin_bal,
+        ("pageclip", b2),
+        ("acctline", begin_fallback),
+        ("pdf", totals.get("begin")),
+    )
+    end_src = _src(
+        end_bal,
+        ("pageclip", e2),
+        ("acctline", end_fallback),
+        ("pdf", totals.get("end")),
+    )
+    if getattr(args, "debug", False) and not checking_lines:
+        print("[markers] checking window empty; using pageclip_lines for transactions as fallback")
+        checking_lines = pageclip_lines[:] # fallback so you still ingest transactions
+    if getattr(args, "debug", False):
+        print(f"[balances] begin={begin_bal} (from {begin_src}); end={end_bal} (from {end_src})")
+
+    if args.debug:
+        # Spot-check: show a small window around Deposits header
+        for i, raw in enumerate(lines, 1):
+            if re.search(r'deposits?', raw, re.I) or re.search(r'additions?|credits?', raw, re.I):
+                print(f"[DEBUG] header-ish line {i}: {raw!r}")
+        def _dump_dep_add_window():
+            start = None
+            for i, raw in enumerate(lines):
+                if DEP_ADD_HDR.search(raw) or re.search(r'DEPOSITS?', raw, re.I):
+                    start = i; break
+            if start is None:
+                print("[DEBUG] No Deposits header found at all."); return
+            print("[DEBUG] Window from header at line {}:".format(start+1))
+            for j in range(start, min(start+40, len(lines))):
+                s = lines[j].rstrip("\n")
+                print(f"{j+1:04d} {s!r}")
+        _dump_dep_add_window()
+   
+    # ---------------- PARSE ----------------
+    rows = parse_stream_simple(lines, end_year, end_month, debug=args.debug)
+    df = pd.DataFrame(rows, columns=["Date","Description","Amount","_src"])
+    # Human-readable source labels for sheets
+   
+    df["Source"] = df["_src"].map(SRC_LABEL).fillna("Unclassified")
+    # --- Correct Source mislabels by description keywords (post-parse) ---
+    desc_uc = df["Description"].astype(str).str.upper()
+
+    atm_like = desc_uc.str.contains(
+        r"(?:\bATM WITHDRAWAL\b|\bCARD PURCHASE\b|\bPOS PURCHASE\b|\bDEBIT CARD\b)",
+        regex=True, na=False
+    )
+    df.loc[atm_like, ["Source","_src"]] = ["ATM & Debit Withdrawals", "ATM"]
+
+    elec_like = desc_uc.str.contains(
+        r"(?:\bACH\s+DEBIT\b|\bONLINE PAYMENT\b|\bAUTO(?:MATIC)? PAYMENT\b|\bZELLE TO\b|\bVENMO\b|\bPAYMENT TO\b)",
+        regex=True, na=False
+    )
+    df.loc[elec_like, ["Source","_src"]] = ["Electronic Withdrawals", "ELEC"]
+
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+
+    if df.empty:
+        print("No transactions parsed.")
+        append_ingest_log(log_ws, dashboard_path, sig, 0, 0)
+        wb.save(dashboard_path) 
+        return
+
+    # ---------------- CATEGORIZE ----------------
+    rules = load_rules(rules_path) if rules_path else []
+    df["Category"] = ""
+    is_dep = df["_src"].eq("DEP_ADD")
+
+    # Deposits sub-buckets
+    df.loc[is_dep, "Category"] = df.loc[is_dep, "Description"].map(categorize_deposit)
+
+    # Non-deposits via rules/defaults
+    mask_rest = ~is_dep
+    df.loc[mask_rest, "Category"] = [
+        (apply_rules(desc, rules) or categorize_default(desc))
+        for desc in df.loc[mask_rest, "Description"].astype(str)
+    ]
+
+    # Section defaults if still blank
+    df.loc[df["_src"].eq("ATM")    & (df["Category"] == ""), "Category"] = "Card/ATM"
+    df.loc[df["_src"].eq("ELEC")   & (df["Category"] == ""), "Category"] = "Electronic"
+    df.loc[df["_src"].eq("CHECKS") & (df["Category"] == ""), "Category"] = "Checks"
+
+    # ---------------- SIGNING (section-first) ----------------
+    mask_dep = df["_src"].eq("DEP_ADD")
+    mask_neg = df["_src"].isin(["CHECKS","ATM","ELEC"])
+    df.loc[mask_dep, "Amount"] = df.loc[mask_dep, "Amount"].abs()
+    df.loc[mask_neg, "Amount"] = -df.loc[mask_neg, "Amount"].abs()
+
+    # Unknown section rows → conservative keyword rules
+    unknown = ~(mask_dep | mask_neg)
+    if unknown.any():
+        desc = df.loc[unknown, "Description"].astype(str).str.lower().fillna("")
+        neg_kw = ["online payment","payment","ach debit","debit card","withdrawal",
+                  "atm withdrawal","transfer to","bill pay","zelle to","venmo cashout",
+                  "card purchase","pos purchase"]
+        pos_kw = ["refund","reversal","return credit","interest","deposit",
+                  "zelle from","transfer from","credit","reimburse"]
+        if len(desc) > 0:
+            neg_mask = desc.str.contains("|".join(map(re.escape, neg_kw)))
+            pos_mask = desc.str.contains("|".join(map(re.escape, pos_kw)))
+            df.loc[unknown & neg_mask, "Amount"] = -df.loc[unknown & neg_mask, "Amount"].abs()
+            df.loc[unknown & pos_mask, "Amount"] = df.loc[unknown & pos_mask, "Amount"].abs()
+    # === Category normalization (put near the end of parse, before writing to Excel) ===
+    CANON = {
+        "food & drink": "Food & Drink",
+        "food/drink": "Food & Drink",
+        "groceries": "Groceries",
+        "gas": "Gas",
+        "utilities": "Utilities",
+        "insurance": "Insurance",
+        "health": "Health & Wellness",
+        "health & wellness": "Health & Wellness",
+        "shopping": "Shopping",
+        "entertainment": "Entertainment",
+        "golf": "Golf / Sports",
+        "golf / sports": "Golf / Sports",
+        "transportation": "Transportation",
+        "donations": "Donations",
+        "refund / return": "Refund / Return",
+        "deposit (other)": "Deposit (Other)",
+        "transfer in": "Transfer In",
+        "transfer out": "Transfer Out",
+        "interest": "Interest",
+        "income": "Income",
+        "checks": "Checks",
+        "card/atm": "Card/ATM",
+        "electronic": "Electronic",
+        "other": "Other",
+    }
+
+    def _canonize(cat: str) -> str:
+        if not isinstance(cat, str): return "Other"
+        key = cat.strip().lower()
+        return CANON.get(key, cat.strip().title())
+
+    df["Category"] = df["Category"].apply(_canonize)
+
+    # Targeted fix: any 'online payment ... to ... credit card' should be negative
+    desc_all = df["Description"].astype(str).str.lower().fillna("")
+    fix_mask = desc_all.str.contains(r"online payment.*to .*credit card")
+    df.loc[fix_mask, "Amount"] = -df.loc[fix_mask, "Amount"].abs()
+    # === Guardrail: alert if "Other" is large ===
+    other_sum = df.loc[df["Category"]=="Other","Amount"].sum()
+    total_spend = df.loc[df["Amount"]<0,"Amount"].abs().sum()
+    if abs(other_sum) > 5000 or (total_spend and abs(other_sum)/total_spend > 0.10):
+        print(f"[WARN] 'Other' unusually large: {other_sum:+.2f} "
+            f"({(abs(other_sum)/total_spend*100):.1f}% of spending)")
+
+    if args.debug:
+        amb = df[~df["_src"].isin(["DEP_ADD","CHECKS","ATM","ELEC"])][["Date","Description","Amount","_src"]].head(30)
+        if not amb.empty:
+            print("\n[DEBUG] Rows without section (signed via keywords):")
+            print(amb.to_string(index=False))
+    # ---------------- BALANCE ADJUSTMENT (make ledger match statement end) ----------------
+    #    dep_total_calc = float(df.loc[df["Amount"] > 0, "Amount"].sum())
+    #    wd_total_calc  = float((-df.loc[df["Amount"] < 0, "Amount"]).sum())
+    #    computed_end   = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
+
+    #    if computed_end is not None and end_bal is not None:
+    #        needed_delta = round(end_bal - computed_end, 2)   # <-- amount to add to ledger
+    #        if abs(needed_delta) >= float(getattr(args, "adjust_threshold", 0.02)):
+    #            df = _append_adj(df, needed_delta, "balance delta")
+    #            print(f"[balance-adjust] added {needed_delta:+.2f}")
+    #except Exception as e:
+    #    print(f"[balance-adjust] skipped due to error: {e}")
+
+    # ---------------- RECON DETAIL (last run) ----------------
+    try:
+        detail_cols = ["Date","Description","Category","Amount","_src","_sign_source","_sign_keyword"]
+        recon_detail = df.copy()
+        for col in detail_cols:
+            if col not in recon_detail.columns:
+                recon_detail[col] = "" if col not in ("Amount","Date") else recon_detail[col]
+        rebuild_sheet(wb, "Recon Detail (last run)", recon_detail[detail_cols])
+    except Exception as _e:
+        if args.debug:
+            print(f"[WARN] Recon Detail not written: {_e}")
+
+    # ---------------- MERGE: per-year + All Transactions ----------------
+    tx_cols = ["Date","Description","Category","Amount","Source","_seq","_ingest_key"]
+    # Stable per-file occurrence key so identical rows don't collapse
+    df["_ingest_key"] = (
+        df["Date"].dt.strftime("%Y-%m-%d")
+        + "||" + df["Description"].astype(str)
+        + "||" + df["Amount"].round(2).astype(str)
+        + "||" + df["_src"].astype(str)
+    )
+
+    # 0,1,2… within this single ingest
+    df["_seq"] = df.groupby("_ingest_key").cumcount()
+    df_tx = df[tx_cols].copy()
+    years_present = sorted({int(y) for y in df_tx["Date"].dt.year.dropna().unique()})
+    years_touched = []
+    total_added = 0
+
+    for y in years_present:
+        yname = str(y)
+        ydf_new = df_tx[df_tx["Date"].dt.year == y].copy()
+        old_y = read_sheet_df(wb, yname)
+        merged_y = merge_dedup(old_y, ydf_new)
+
+        # Write back per-year sheet
+        if yname in wb.sheetnames:
+            ws_y = wb[yname]
+        else:
+            ws_y = wb.create_sheet(yname)
+        display_y = merged_y.drop(columns=["_seq","_ingest_key"], errors="ignore")   
+        write_df(ws_y, display_y)
+        apply_source_banding(ws_y)
+
+        if len(merged_y) != len(old_y):
+            years_touched.append(yname)
+            total_added += max(0, len(merged_y) - len(old_y))
+
+    # Update "All Transactions"
+    old_all = read_sheet_df(wb, "All Transactions")
+    merged_all = merge_dedup(old_all, df_tx)
+    if "All Transactions" in wb.sheetnames:
+        ws_all = wb["All Transactions"]
+    else:
+        ws_all = wb.create_sheet("All Transactions")
+    display_all = merged_all.drop(columns=["_seq","_ingest_key"], errors="ignore")
+    write_df(ws_all, display_all)
+    apply_source_banding(ws_all)
+
+    # ---------------- SUMMARIES (full stack) ----------------
+    stack = read_sheet_df(wb, "All Transactions")
+    monthly_summary, yearly_summary = build_summaries_with_totals(stack)
+    upsert_summary_sheet(wb, "Monthly Summary", monthly_summary, key_col="Month")
+    upsert_summary_sheet(wb, "Yearly Summary",  yearly_summary,  key_col="Year")
+    # After upserting Yearly Summary, rebuild YOY from the sheet’s current state
+    ys_ws = wb["Yearly Summary"]
+    ys_cols = [c.value for c in ys_ws[1]]
+    ys_rows = [r for r in ys_ws.iter_rows(min_row=2, values_only=True)]
+    ys_df   = pd.DataFrame(ys_rows, columns=ys_cols)
+
+    yoy = ys_df.pivot_table(
+        index="Category", columns="Year", values="Amount",
+        aggfunc="sum", fill_value=0
+    ).reset_index()
+    rebuild_sheet(wb, "YOY Comparison", yoy)
+    if args.debug:
+        print(df["_src"].value_counts(dropna=False))
+        print(df[df["Amount"] < 0].groupby("_src")["Amount"].sum())
+    # ---------------- BALANCE RECONCILIATION ----------------
+    try:
+        dep_total_calc = float(df.loc[df["Amount"] > 0, "Amount"].sum())
+        wd_total_calc  = float((-df.loc[df["Amount"] < 0, "Amount"]).sum())
+        computed_end   = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
+
+        # AUTO-ADJUST (optional)
+        try:
+            if getattr(args, "auto_adjust", False) and (computed_end is not None) and (end_bal is not None):
+                needed_delta = round(end_bal - computed_end, 2)
+                if abs(needed_delta) >= float(getattr(args, "adjust_threshold", 0.02)):
+                    df = _append_adj(df, needed_delta, "balance delta")
+                    print(f"[balance-adjust] added {needed_delta:+.2f}")
+        except Exception as _e:
+            print(f"[balance-adjust] skipped due to error: {_e}")
+
+        # Build/Update 'Balance Reconciliation' sheet
+        # Read existing or create columns
+        sheet_name = "Balance Reconciliation"
+        if sheet_name in wb.sheetnames:
+            ws_rc = wb[sheet_name]
+            cols = [c.value for c in ws_rc[1]] if ws_rc.max_row >= 1 else \
+                   ["Statement End","Begin","Deposits (calc)","Withdrawals (calc)","Computed End",
+                    "Statement End (reported)","Diff","Stmt Deposits","Stmt Withdrawals","Δ Deposits","Δ Withdrawals"]
+            rows = [r for r in ws_rc.iter_rows(min_row=2, values_only=True)] if ws_rc.max_row >= 2 else []
+            recon_df = pd.DataFrame(rows, columns=cols)
+        else:
+            recon_df = pd.DataFrame(columns=[
+                "Statement End","Begin","Deposits (calc)","Withdrawals (calc)","Computed End",
+                "Statement End (reported)","Diff","Stmt Deposits","Stmt Withdrawals","Δ Deposits","Δ Withdrawals"
+            ])
+        # Calculated per-source totals from parsed rows (after signing)
+        sec_sums = df.groupby("_src")["Amount"].sum().to_dict()
+        dep_total_calc   = float(abs(sec_sums.get("DEP_ADD", 0.0)))
+        checks_total_calc= float(abs(sec_sums.get("CHECKS", 0.0)))
+        atm_total_calc   = float(abs(sec_sums.get("ATM", 0.0)))
+        elec_total_calc  = float(abs(sec_sums.get("ELEC", 0.0)))
+
+        # Overall withdrawals = checks + atm + elec
+        wd_total_calc = checks_total_calc + atm_total_calc + elec_total_calc
+
+        computed_end   = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
+        # Statement end date from filename
+        m_date = re.search(r"(20\d{2})(\d{2})(\d{2})", input_path.stem)
+        stmt_end_ts = pd.NaT
+        if m_date:
+            y, mth, d = map(int, m_date.groups())
+            stmt_end_ts = pd.Timestamp(y, mth, d)
+        # ---------------- Extended Balance Reconciliation ----------------
+        # Parse section totals from text
+        secs_txt = parse_section_totals(lines)
+        stmt_dep   = secs_txt["dep"]
+        stmt_checks= secs_txt["checks"]
+        stmt_atm   = secs_txt["atm"]
+        stmt_elec  = secs_txt["elec"]
+
+        # Calculate per-source totals
+        sec_sums = df.groupby("_src")["Amount"].sum().to_dict()
+        dep_total_calc    = float(abs(sec_sums.get("DEP_ADD", 0.0)))
+        checks_total_calc = float(abs(sec_sums.get("CHECKS", 0.0)))
+        atm_total_calc    = float(abs(sec_sums.get("ATM", 0.0)))
+        elec_total_calc   = float(abs(sec_sums.get("ELEC", 0.0)))
+        wd_total_calc     = checks_total_calc + atm_total_calc + elec_total_calc
+
+        computed_end = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
+        stmt_diff = None if (computed_end is None or end_bal is None) else (computed_end - end_bal)
+
+        # Compose the reconciliation row
+        new_row = {
+            "Statement End": stmt_end_ts,
+            "Begin": begin_bal,
+            "Deposits (calc)": dep_total_calc,
+            "Checks (calc)": checks_total_calc,
+            "ATM (calc)": atm_total_calc,
+            "Electronic (calc)": elec_total_calc,
+            "Withdrawals (calc)": wd_total_calc,
+            "Computed End": computed_end,
+            "Statement End (reported)": end_bal,
+
+            "Stmt Deposits": stmt_dep,
+            "Stmt Checks": stmt_checks,
+            "Stmt ATM": stmt_atm,
+            "Stmt Electronic": stmt_elec,
+
+            "Δ Deposits": (None if stmt_dep    is None else round(dep_total_calc    - stmt_dep,    2)),
+            "Δ Checks":  (None if stmt_checks  is None else round(checks_total_calc - stmt_checks, 2)),
+            "Δ ATM":     (None if stmt_atm     is None else round(atm_total_calc    - stmt_atm,    2)),
+            "Δ Electronic": (None if stmt_elec is None else round(elec_total_calc   - stmt_elec,   2)),
+
+            "Diff": (None if stmt_diff is None else round(stmt_diff, 2)),
+        }
+
+        # --- Build/Update 'Balance Reconciliation' sheet ---
+        sheet_name = "Balance Reconciliation"
+        cols_recon = [
+            "Statement End","Begin",
+            "Deposits (calc)","Checks (calc)","ATM (calc)","Electronic (calc)","Withdrawals (calc)",
+            "Computed End","Statement End (reported)",
+            "Stmt Deposits","Stmt Checks","Stmt ATM","Stmt Electronic",
+            "Δ Deposits","Δ Checks","Δ ATM","Δ Electronic",
+            "Diff"
+        ]
+
+        # Read existing sheet (if any)
+        if sheet_name in wb.sheetnames and wb[sheet_name].max_row >= 2:
+            ws_rc = wb[sheet_name]
+            old_cols = [c.value for c in ws_rc[1]]
+            old_rows = [r for r in ws_rc.iter_rows(min_row=2, values_only=True)]
+            recon_df = pd.DataFrame(old_rows, columns=old_cols)
+            # Align to expected schema (add missing cols, drop extras)
+            for c in cols_recon:
+                if c not in recon_df.columns:
+                    recon_df[c] = pd.NA
+            recon_df = recon_df[cols_recon]
+        else:
+            recon_df = pd.DataFrame(columns=cols_recon)
+
+        # Build the new row, aligned to schema
+        row_df = pd.DataFrame([new_row]).reindex(columns=cols_recon)
+
+        # Upsert by Statement End (compare by date to avoid tz/NaT weirdness)
+        if not recon_df.empty:
+            recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
+        se_new_date = pd.to_datetime(row_df.iloc[0]["Statement End"], errors="coerce").date()
+        if not recon_df.empty:
+            keep_mask = recon_df["Statement End"].dt.date.ne(se_new_date)
+            recon_df = recon_df[keep_mask]
+
+        # Append and sort
+        recon_df = pd.concat([recon_df, row_df], ignore_index=True)
+        recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
+        recon_df = recon_df.sort_values("Statement End").reset_index(drop=True)
+
+        rebuild_sheet(wb, sheet_name, recon_df)
+
+        if args.debug:
+            print(f"[DEBUG] Reconciliation row: begin={begin_bal}, dep={dep_total_calc}, wd={wd_total_calc}, "
+                  f"computed_end={computed_end}, end_reported={end_bal}, diff={stmt_diff}")
+
+    except Exception as e:
+        if args.debug:
+            print(f"[WARN] Reconciliation step skipped due to error: {e}")
+
+    # ---------------- PDF VERIFICATION (optional) ----------------
+
+    if getattr(args, "verify_pdf", False) and getattr(args, "pdf", None):
+        try:
+            dep_total_calc = float(df.loc[df["Amount"] > 0, "Amount"].sum())
+            wd_total_calc  = float((-df.loc[df["Amount"] < 0, "Amount"]).sum())
+            comp_end = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
+
+           
+            report = verify_statement_pdf(
+                args.pdf,
+                df,
+                begin_bal,
+                comp_end,
+                within_checking_band=True,   # <<< important
+                debug=args.debug,
+            )
+            # Write a small sheet with the summary + issues
+            name = "PDF Verify"
+            if name in wb.sheetnames:
+                ws = wb[name]; ws.delete_rows(1, ws.max_row)
+            else:
+                ws = wb.create_sheet(name)
+
+            ws.append(["Key","Value"])
+            summ = report.get("summary", {})
+            print(f"[verify-pdf] status={summ.get('status')} reason={summ.get('reason')}")
+            for k in ["status","rows_checked","rows_matched_same_page","rows_missing",
+                      "begin_balance_txt","begin_balance_calc","end_balance_txt","end_balance_calc",
+                      "total_deposits_txt","total_withdrawals_txt"]:
+                ws.append([k, summ.get(k)])
+
+            ws.append([]); ws.append(["RowIndex","Date","Amount","Description","PageForDate","PageForAmount"])
+            for it in report.get("issues", []):
+                ws.append([it.get("RowIndex"), it.get("Date"), it.get("Amount"),
+                           it.get("Description"), it.get("PageForDate"), it.get("PageForAmount")])
+            print(f"[verify-pdf] status={summ.get('status')}  rows_missing={summ.get('rows_missing')}")
+        except Exception as e:
+            print(f"[verify-pdf] skipped due to error: {e}")
+    # ---------------- SAVE & LOG ----------------
+    #  Put audit_recon here?
+    # --- audit ---
+    # --- AUDIT (only when --audit is passed) ---
+    if getattr(args, "audit", False):
+        try:
+            from audit_recon import normalize, imbalance_summary
+            df_norm = normalize(df)
+            report  = imbalance_summary(df_norm)
+
+            audit_path = Path(args.dashboard).with_name(
+                Path(args.dashboard).stem + "_Audit.xlsx"
+            )
+            with pd.ExcelWriter(audit_path, engine="xlsxwriter") as xw:
+                # keyword-only args for pandas 3.0+
+                report['month_recon'].to_excel(xw, sheet_name='Month_Recon', index=False)
+                report['sign_anomalies'].to_excel(xw, sheet_name='Sign_Anomalies', index=False)
+                report['near_duplicates'].to_excel(xw, sheet_name='Near_Duplicates', index=False)
+                report['pershing_issues'].to_excel(xw, sheet_name='Pershing_Check', index=False)
+                if report.get('by_source_file') is not None:
+                    report['by_source_file'].to_excel(xw, sheet_name='By_Source_File', index=False)
+
+            print(f"[audit] wrote {audit_path}")
+        except Exception as e:
+            print(f"[audit] skipped due to error: {e}")
+
+# --- save workbook (your existing code follows) ---
+
+    append_ingest_log(log_ws, dashboard_path, sig, len(df), total_added)
+    write_color_legend(wb)
+    wb.save(dashboard_path)
+    if years_touched:
+        print(f"Done. Updated year sheets: {', '.join(sorted(set(years_touched)))} in {dashboard_path.name}.")
+    else:
+        print(f"Done. No year sheets changed in {dashboard_path.name}.")
+    if args.debug:
+        print(f"[DEBUG] begin_bal={begin_bal}  end_bal={end_bal}")
+
+if __name__ == "__main__":
+    main()
