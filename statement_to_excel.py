@@ -20,7 +20,7 @@ import unicodedata
 import shutil
 import pandas as pd
 import xlsxwriter
-__version__ = "0.10.2"  # bump this when you cut a release/tag
+__version__ = "0.10.9"  # bump this when you cut a release/tag
 
 def git_version():
     try:
@@ -1701,53 +1701,12 @@ def main():
         wd_total_calc = checks_total_calc + atm_total_calc + elec_total_calc
 
         computed_end   = None if begin_bal is None else (begin_bal + dep_total_calc - wd_total_calc)
-
-        # Statement totals from the text
-        # Statement totals from the text (four sections)
-        secs_txt = parse_section_totals(lines)
-        stmt_dep   = secs_txt["dep"]
-        stmt_checks= secs_txt["checks"]
-        stmt_atm   = secs_txt["atm"]
-        stmt_elec  = secs_txt["elec"]
-
-        # ... existing stmt_end_ts code stays ...
         # Statement end date from filename
         m_date = re.search(r"(20\d{2})(\d{2})(\d{2})", input_path.stem)
         stmt_end_ts = pd.NaT
         if m_date:
             y, mth, d = map(int, m_date.groups())
             stmt_end_ts = pd.Timestamp(y, mth, d)
-
-        stmt_diff = None if (computed_end is None or end_bal is None) else (computed_end - end_bal)
-
-        new_row = {
-            "Statement End": stmt_end_ts,
-            "Begin": begin_bal,
-            "Deposits (calc)": dep_total_calc,
-            "Checks (calc)": checks_total_calc,
-            "ATM (calc)": atm_total_calc,
-            "Electronic (calc)": elec_total_calc,
-            "Withdrawals (calc)": wd_total_calc,
-            "Computed End": computed_end,
-            "Statement End (reported)": end_bal,
-
-            # Text (PDF/text) section totals
-            "Stmt Deposits": stmt_dep,
-            "Stmt Checks": stmt_checks,
-            "Stmt ATM": stmt_atm,
-            "Stmt Electronic": stmt_elec,
-
-            # Deltas (calc - stmt)
-            "Δ Deposits": (None if stmt_dep   is None else round(dep_total_calc    - stmt_dep,    2)),
-            "Δ Checks":  (None if stmt_checks is None else round(checks_total_calc - stmt_checks, 2)),
-            "Δ ATM":     (None if stmt_atm    is None else round(atm_total_calc    - stmt_atm,    2)),
-            "Δ Electronic": (None if stmt_elec is None else round(elec_total_calc  - stmt_elec,   2)),
-
-            # End balance diff (computed - reported)
-            "Diff": (None if stmt_diff is None else round(stmt_diff, 2)),
-        }
-
-        
         # ---------------- Extended Balance Reconciliation ----------------
         # Parse section totals from text
         secs_txt = parse_section_totals(lines)
@@ -1792,8 +1751,8 @@ def main():
             "Diff": (None if stmt_diff is None else round(stmt_diff, 2)),
         }
 
-
-        # 1) Normalize recon_df to the expected schema (handles “sheet exists with odd headers”)
+        # --- Build/Update 'Balance Reconciliation' sheet ---
+        sheet_name = "Balance Reconciliation"
         cols_recon = [
             "Statement End","Begin",
             "Deposits (calc)","Checks (calc)","ATM (calc)","Electronic (calc)","Withdrawals (calc)",
@@ -1802,29 +1761,39 @@ def main():
             "Δ Deposits","Δ Checks","Δ ATM","Δ Electronic",
             "Diff"
         ]
-        recon_df = pd.DataFrame(columns=cols_recon)
-        # 2) Build a one-row DF for the new record, already aligned to the schema
+
+        # Read existing sheet (if any)
+        if sheet_name in wb.sheetnames and wb[sheet_name].max_row >= 2:
+            ws_rc = wb[sheet_name]
+            old_cols = [c.value for c in ws_rc[1]]
+            old_rows = [r for r in ws_rc.iter_rows(min_row=2, values_only=True)]
+            recon_df = pd.DataFrame(old_rows, columns=old_cols)
+            # Align to expected schema (add missing cols, drop extras)
+            for c in cols_recon:
+                if c not in recon_df.columns:
+                    recon_df[c] = pd.NA
+            recon_df = recon_df[cols_recon]
+        else:
+            recon_df = pd.DataFrame(columns=cols_recon)
+
+        # Build the new row, aligned to schema
         row_df = pd.DataFrame([new_row]).reindex(columns=cols_recon)
 
-        # 3) True upsert: drop any existing row with the same Statement End
-        if not recon_df.empty:
-            recon_df = recon_df[recon_df["Statement End"] != row_df.iloc[0]["Statement End"]]
-
-        # 4) Append without triggering the empty/all-NA concat warning
-        parts = []
-        if not recon_df.empty and not recon_df.isna().all().all():
-            parts.append(recon_df)
-        if not row_df.empty and not row_df.isna().all().all():
-            parts.append(row_df)
-
-        recon_df = pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols_recon)
-
-        # 5) Sort by date safely
+        # Upsert by Statement End (compare by date to avoid tz/NaT weirdness)
         if not recon_df.empty:
             recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
-            recon_df = recon_df.sort_values("Statement End").reset_index(drop=True)
+        se_new_date = pd.to_datetime(row_df.iloc[0]["Statement End"], errors="coerce").date()
+        if not recon_df.empty:
+            keep_mask = recon_df["Statement End"].dt.date.ne(se_new_date)
+            recon_df = recon_df[keep_mask]
+
+        # Append and sort
+        recon_df = pd.concat([recon_df, row_df], ignore_index=True)
+        recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
+        recon_df = recon_df.sort_values("Statement End").reset_index(drop=True)
 
         rebuild_sheet(wb, sheet_name, recon_df)
+
         if args.debug:
             print(f"[DEBUG] Reconciliation row: begin={begin_bal}, dep={dep_total_calc}, wd={wd_total_calc}, "
                   f"computed_end={computed_end}, end_reported={end_bal}, diff={stmt_diff}")

@@ -26,7 +26,7 @@ try:
     import pdfplumber  # type: ignore
 except Exception:
     pdfplumber = None
-
+__version__ = "0.10.9"  # bump this when you cut a release/tag
 CHECKING_HDRS = [
     r"DEPOSITS\s+AND\s+ADDITIONS",
     r"CHECKS?\s+PAID",
