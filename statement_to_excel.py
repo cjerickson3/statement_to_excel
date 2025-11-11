@@ -20,7 +20,7 @@ import unicodedata
 import shutil
 import pandas as pd
 import xlsxwriter
-__version__ = "0.10.12-header-trust"  # bump this when you cut a release/tag
+__version__ = "v0.10.13-fees-stable"  # bump this when you cut a release/tag
 
 def git_version():
     try:
@@ -119,6 +119,8 @@ CHECK_SNIFF = re.compile(
 )
 
 # Matches: Deposits & Additions, Deposits and Additions, Deposits & Other Additions, Deposits & Credits, etc.
+OTHER_WITH_HDR = re.compile(r'^\s*OTHER\s+WITHDRAWALS?\b', re.I)
+FEES_HDR       = re.compile(r'^\s*FEES?\b', re.I)
 
 # Next-section detectors
 NEXT_SEC = re.compile(
@@ -205,6 +207,30 @@ TOT_DEP_RE   = re.compile(r"Total\s+Deposits\s+and\s+Additions\s*\$?\s*([0-9,]+\
 TOT_CHECKS_RE= re.compile(r"Total\s+Checks\s+Paid\s*\$?\s*([0-9,]+\.\d{2})", re.I)
 TOT_ATM_RE   = re.compile(r"Total\s+ATM\s*&\s*Debit\s*Card\s*Withdrawals\s*\$?\s*([0-9,]+\.\d{2})", re.I)
 TOT_ELEC_RE  = re.compile(r"Total\s+Electronic\s+Withdrawals\s*\$?\s*([0-9,]+\.\d{2})", re.I)
+# --- Fees summary extractor (summary-only, no dated rows) ---
+FEES_LINE_RE  = re.compile(r'^\s*Fees\s+(-?\$?\s*\d{1,3}(?:,\d{3})*\.\d{2})\s*$', re.I)
+TOTAL_FEES_RE = re.compile(r'^\s*Total\s+Fees\s+\$?\s*([0-9,]+\.\d{2})\s*$', re.I)
+
+def parse_fees_total(lines: list[str]) -> float | None:
+    """
+    Returns the statement Fees as a positive float if found,
+    or None if not present. (We’ll apply the correct sign later.)
+    """
+    fees = None
+    for raw in lines:
+        s = (raw or "").strip()
+        m1 = FEES_LINE_RE.match(s)
+        if m1:
+            # m1 may include a leading '-' or trailing '-'
+            amt = clean_amount(m1.group(1))
+            fees = abs(amt)  # normalize to positive here
+        m2 = TOTAL_FEES_RE.match(s)
+        if m2:
+            try:
+                fees = float(m2.group(1).replace(',', ''))
+            except Exception:
+                pass
+    return fees
 
 def parse_section_totals(lines: list[str]) -> dict:
     """
@@ -643,6 +669,8 @@ def parse_by_startend_markers(lines: list[str], *, debug=False) -> list[str]:
         "checkspaid",
         "atmdebitwithdrawal",
         "electronicwithdrawal",
+        "otherwithdrawal",   # NEW
+        "fees",              # NEW
     }
     want_present &= WANT  # limit to the sections we care about
 
@@ -652,18 +680,21 @@ def parse_by_startend_markers(lines: list[str], *, debug=False) -> list[str]:
 
     # 2) Slice by real headers (continuations included) and keep wanted ones
     HDRS = [
-    (re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I), "depositsandadditions"),
-    (re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),                       "checkspaid"),
-    (re.compile(r'^\s*CHECK\s*NO\.\s*DESCRIPTION\b', re.I),           "checkspaid"),  # <- new alt header
-    (re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I), "atmdebitwithdrawal"),
-    (re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),            "electronicwithdrawal"),
+        (re.compile(r'^\s*DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)\b', re.I), "depositsandadditions"),
+        (re.compile(r'^\s*CHECKS?\s+PAID\b', re.I),                       "checkspaid"),
+        (re.compile(r'^\s*CHECK\s*NO\.\s*DESCRIPTION\b', re.I),           "checkspaid"),
+        (re.compile(r'^\s*ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?\b', re.I), "atmdebitwithdrawal"),
+        (re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I),            "electronicwithdrawal"),
+        (re.compile(r'^\s*OTHER\s+WITHDRAWALS?\b', re.I),                 "otherwithdrawal"),  # NEW
+        (re.compile(r'^\s*FEES?\b', re.I),                                "fees"),             # NEW
     ]
 
     MAJOR_STOP = re.compile(
-        r"^(?:\s*)(?:CHECKING\s+SUMMARY|CHECK\s+NO\.\s+DESCRIPTION|"
-        r"CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"
-        r"ELECTRONIC\s+WITHDRAWALS?|DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?))\b",
-        re.I
+    r"^(?:\s*)(?:CHECKING\s+SUMMARY|CHECK\s+NO\.\s+DESCRIPTION|"
+    r"CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|"
+    r"ELECTRONIC\s+WITHDRAWALS?|OTHER\s+WITHDRAWALS?|FEES?\b|"
+    r"DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?))\b",
+    re.I
     )
 
     kept, i, N = [], 0, len(lines)
@@ -696,10 +727,11 @@ MAJOR_BREAK = re.compile(r'^\s*(TRANSACTION\s+DETAIL|DATE\s+DESCRIPTION\s+AMOUNT
 def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=False, trust_headers: bool=False):
 
     """
-    Header-driven parse. Handles wrapped amounts and 3-line cash-back pattern.
     Sections:
-      0 = Deposits & Additions, 1 = Checks, 2 = ATM & Debit, 3 = Electronic
+    0 = Deposits & Additions, 1 = Checks, 2 = ATM & Debit, 3 = Electronic,
+    4 = Other Withdrawals,     5 = Fees
     """
+
     out = []  # (Date, Description, Amount, _src)
     N = len(lines)
 
@@ -746,6 +778,14 @@ def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=Fal
         if ELEC_WITH_HDR.search(line) and not AMT_RE.search(line):
             sec = 3; saw_elec_header = True; i += 1;
             if debug: print(f"-> header: ELECTRONIC at {i}")
+            continue
+        if OTHER_WITH_HDR.search(line) and not AMT_RE.search(line):
+            sec = 4; i += 1;
+            if debug: print(f"-> header: OTHER WITHDRAWALS at {i}")
+            continue
+        if FEES_HDR.search(line) and not AMT_RE.search(line):
+            sec = 5; i += 1;
+            if debug: print(f"-> header: FEES at {i}")
             continue
 
         # --- Check-number-first rows (existing code, unchanged) ---
@@ -810,15 +850,21 @@ def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=Fal
                 else:
                     sec = 3 if classify_withdrawal_line(desc) == "ELEC" else 2
 
-            # Sign and _src by section
+           # Sign and _src by section
             if sec in (-1, 0):
                 signed, src_tag = abs(amt), "DEP_ADD"
             elif sec == 1:
                 signed, src_tag = -abs(amt), "CHECKS"
             elif sec == 2:
                 signed, src_tag = -abs(amt), "ATM"
-            else:
+            elif sec == 3:
                 signed, src_tag = -abs(amt), "ELEC"
+            elif sec == 4:  # Other Withdrawals
+                signed, src_tag = -abs(amt), "OTHER"
+            elif sec == 5:  # Fees
+                signed, src_tag = -abs(amt), "FEES"
+            else:
+                signed, src_tag = -abs(amt), "ELEC"  # conservative default
 
             out.append((f"{year:04d}/{mm:02d}/{dd:02d}", desc, signed, src_tag))
             i += max(1, use_look + 1)
@@ -1013,11 +1059,13 @@ def upsert_summary_sheet(wb, name: str, new_df: pd.DataFrame, key_col: str):
 
 def clip_to_checking_lines(lines, *, debug: bool=False):
     ELEC_WITH_HDR     = re.compile(r'^\s*ELECTRONIC\s+WITHDRAWALS?\b', re.I)
-    MAJOR_STOP        = re.compile(
+    MAJOR_STOP = re.compile(
         r'^(?:\s*)(?:CHECKS?\s+PAID|ATM\s*&?\s*DEBIT\s*CARD\s*WITHDRAWALS?|'
-        r'ELECTRONIC\s+WITHDRAWALS?|DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)|CHECKING\s+SUMMARY)\b',
+        r'ELECTRONIC\s+WITHDRAWALS?|OTHER\s+WITHDRAWALS?|FEES?\b|'
+        r'DEPOSITS?\b.*\b(ADDITIONS?|CREDITS?)|CHECKING\s+SUMMARY)\b',
         re.I
     )
+
     SAVINGS_BANNER    = re.compile(r'^\s*(?:CHASE\s+SAVINGS|SAVINGS\s+SUMMARY)\s*$', re.I)
     SAVINGS_TABLEHDR  = re.compile(r'^\s*DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE\b', re.I)
     DATE_HEAD         = re.compile(r'^\s*(1[0-2]|0?[1-9])\s*[/-]\s*(3[01]|[12]\d|0?[1-9])\b')
@@ -1486,6 +1534,31 @@ def main():
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+    # --- Append a single 'Fees' row if the statement shows Fees in summary-only form ---
+    fees_amt_pos = parse_fees_total(raw_lines)
+    if fees_amt_pos is not None:
+    # Use statement end date from filename if available; else last txn date
+        stmt_end = None
+        m_date = re.search(r"(20\d{2})(\d{2})(\d{2})", input_path.stem)
+        if m_date:
+            y, mth, d = map(int, m_date.groups())
+            stmt_end = pd.Timestamp(y, mth, d)
+        else:
+            stmt_end = (df["Date"].max() if not df.empty else pd.Timestamp.today().normalize())
+
+        fees_row = pd.DataFrame([{
+            "Date": stmt_end,
+            "Description": "Fees (statement summary)",
+            "Amount": (float(fees_amt_pos)), # Leave positive signing will flip
+            "Category": "Fees", 
+            "_src": "FEES",
+        }])
+        df = pd.concat([df, fees_row], ignore_index=True)
+        # force Source remap after appending
+        df["Source"] = df["_src"].map(SRC_LABEL).fillna(df.get("Source", "Unclassified"))
+        # (no concat at all if fees not found → no UnboundLocalError)
+        if args.debug:
+            print(df[df["_src"]=="FEES"][["Date","Description","Amount","Source"]])
 
     if df.empty:
         print("No transactions parsed.")
@@ -1503,19 +1576,21 @@ def main():
 
     # Non-deposits via rules/defaults
     mask_rest = ~is_dep
+    fill_mask = mask_rest & (df["Category"].astype(str) == "")
     df.loc[mask_rest, "Category"] = [
         (apply_rules(desc, rules) or categorize_default(desc))
-        for desc in df.loc[mask_rest, "Description"].astype(str)
+        for desc in df.loc[fill_mask, "Description"].astype(str)
     ]
 
     # Section defaults if still blank
     df.loc[df["_src"].eq("ATM")    & (df["Category"] == ""), "Category"] = "Card/ATM"
     df.loc[df["_src"].eq("ELEC")   & (df["Category"] == ""), "Category"] = "Electronic"
     df.loc[df["_src"].eq("CHECKS") & (df["Category"] == ""), "Category"] = "Checks"
+    df.loc[df["_src"].eq("FEES") & (df["Category"] == ""), "Category"] = "Fees"
 
     # ---------------- SIGNING (section-first) ----------------
     mask_dep = df["_src"].eq("DEP_ADD")
-    mask_neg = df["_src"].isin(["CHECKS","ATM","ELEC"])
+    mask_neg = df["_src"].isin(["CHECKS","ATM","ELEC","OTHER","FEES"])
     df.loc[mask_dep, "Amount"] = df.loc[mask_dep, "Amount"].abs()
     df.loc[mask_neg, "Amount"] = -df.loc[mask_neg, "Amount"].abs()
 

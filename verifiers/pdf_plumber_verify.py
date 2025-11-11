@@ -20,7 +20,7 @@ try:
     import pdfplumber  # type: ignore
 except Exception:  # pragma: no cover
     pdfplumber = None
-__version__ = "0.10.12-header-trust"  # bump this when you cut a release/tag
+__version__ = "v0.10.13-fees-stable"  # bump this when you cut a release/tag
 # ---------- Regex helpers ----------
 # Tolerant “row-level” predicates
 TOP_PATTS = [
