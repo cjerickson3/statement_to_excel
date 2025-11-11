@@ -189,7 +189,10 @@ SRC_LABEL = {
     "ATM": "ATM & Debit Withdrawals",
     "ELEC": "Electronic Withdrawals",
     "ADJUST": "Adjustment",
+    "OTHER": "Other Withdrawals",  # <-- future table (no logic yet)
+    "FEES":  "Fees",               # <-- future table (no logic yet)
 }
+
 SRC_FILLS = {
     "Deposits":               PatternFill(fill_type="solid", start_color="E6F4EA"),  # soft green
     "Checks":                 PatternFill(fill_type="solid", start_color="FDE7E9"),  # soft red
@@ -690,7 +693,8 @@ def parse_by_startend_markers(lines: list[str], *, debug=False) -> list[str]:
 # --- Single-pass stream parser (deposits → checks → atm → electronic) ---
 MAJOR_BREAK = re.compile(r'^\s*(TRANSACTION\s+DETAIL|DATE\s+DESCRIPTION\s+AMOUNT\s+BALANCE)\b', re.I)
 
-def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=False):
+def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=False, trust_headers: bool=False):
+
     """
     Header-driven parse. Handles wrapped amounts and 3-line cash-back pattern.
     Sections:
@@ -785,15 +789,18 @@ def parse_stream_simple(lines, end_year: int, end_month: int, *, debug: bool=Fal
                 i += 1; continue
 
             # --- State/heuristic transition: ATM → Electronic ---
-            if sec == 2 and not saw_elec_header:
-                guess = classify_withdrawal_line(desc)
-                if guess == "ELEC":
-                    sec = 3
-                elif guess == "ATM":
-                    sec = 2
-                else:
-                    # ambiguous: prefer Electronic after ATM if keywords absent
-                    sec = 3
+            # --- State/heuristic transition: ATM → Electronic ---
+            # When we trust PDF-derived headers/slicing, DO NOT auto-flip sections.
+            if not trust_headers:
+                if sec == 2 and not saw_elec_header:
+                    guess = classify_withdrawal_line(desc)
+                    if guess == "ELEC":
+                        sec = 3
+                    elif guess == "ATM":
+                        sec = 2
+                    else:
+                        # ambiguous: prefer Electronic after ATM if keywords absent
+                        sec = 3
 
             # Default section if unknown
             if sec == -1:
@@ -1448,25 +1455,34 @@ def main():
         _dump_dep_add_window()
    
     # ---------------- PARSE ----------------
-    rows = parse_stream_simple(lines, end_year, end_month, debug=args.debug)
+    rows = parse_stream_simple(
+        lines, end_year, end_month,
+        debug=args.debug,
+        trust_headers=bool(args.pdf and healthy)
+    )
+
     df = pd.DataFrame(rows, columns=["Date","Description","Amount","_src"])
     # Human-readable source labels for sheets
    
     df["Source"] = df["_src"].map(SRC_LABEL).fillna("Unclassified")
-    # --- Correct Source mislabels by description keywords (post-parse) ---
     desc_uc = df["Description"].astype(str).str.upper()
 
-    atm_like = desc_uc.str.contains(
-        r"(?:\bATM WITHDRAWAL\b|\bCARD PURCHASE\b|\bPOS PURCHASE\b|\bDEBIT CARD\b)",
-        regex=True, na=False
-    )
-    df.loc[atm_like, ["Source","_src"]] = ["ATM & Debit Withdrawals", "ATM"]
+    if not (args.pdf and healthy):
+        atm_like  = desc_uc.str.contains(
+            r"(?:\bATM WITHDRAWAL\b|\bCARD PURCHASE\b|\bPOS PURCHASE\b|\bDEBIT CARD\b)",
+            regex=True, na=False
+        )
+        df.loc[atm_like, ["Source","_src"]] = ["ATM & Debit Withdrawals", "ATM"]
+        # keep your ELEC reclass commented out (or guard it the same way if you re-enable)
+    else:
+        if args.debug:
+            print("[reclass] skipped keyword-based reclass (trusting headers/PDF slice)")
 
-    elec_like = desc_uc.str.contains(
-        r"(?:\bACH\s+DEBIT\b|\bONLINE PAYMENT\b|\bAUTO(?:MATIC)? PAYMENT\b|\bZELLE TO\b|\bVENMO\b|\bPAYMENT TO\b)",
-        regex=True, na=False
-    )
-    df.loc[elec_like, ["Source","_src"]] = ["Electronic Withdrawals", "ELEC"]
+    #elec_like = desc_uc.str.contains(
+    #    r"(?:\bACH\s+DEBIT\b|\bONLINE PAYMENT\b|\bAUTO(?:MATIC)? PAYMENT\b|\bZELLE TO\b|\bVENMO\b|\bPAYMENT TO\b)",
+    #    regex=True, na=False
+    #)
+    #df.loc[elec_like, ["Source","_src"]] = ["Electronic Withdrawals", "ELEC"]
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
