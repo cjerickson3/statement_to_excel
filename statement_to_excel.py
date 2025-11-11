@@ -20,7 +20,7 @@ import unicodedata
 import shutil
 import pandas as pd
 import xlsxwriter
-__version__ = "0.10.9"  # bump this when you cut a release/tag
+__version__ = "0.10.12-header-trust"  # bump this when you cut a release/tag
 
 def git_version():
     try:
