@@ -594,31 +594,151 @@ def load_rules(csv_path: Path):
     return rules
 
 def categorize_default(description: str) -> str:
+    """
+    Best-effort default categorizer for non-deposit transactions.
+    Uses your new category scheme (Dining, Subscriptions, etc.).
+    """
     u = (description or "").upper()
-    if u.startswith("CHECK #"): return "Checks"
-    if "WAL-MART" in u or "WALMART" in u: return "Groceries"
-    if u.startswith("TST*"): return "Food & drink"
-    if "PERSHING" in u: return "401K transfer"
-    if "ONLINE PAYMENT" in u: return "Online payment"
-    if "HOME DEPOT" in u or "LOWES" in u: return "Home Repair"
-    if "GOLF" in u: return "Golf"
-    if "WELLCARE" in u or "CHIROPRACT" in u: return "Health & wellness"
-    if "KERA" in u: return "Donations"
-    if any(x in u for x in ["City of Plano","Solar","ATMOS"]): return "Utility"
-    if any(x in u for x in ["Allstate","Northwestern Mutual Isa","Unitedhealthone Ins"]): return "Insurance"
-    if any(x in u for x in ["KROGER","TRADER JOE","TOM THUMB","CENTRAL MARKET","MARKET STREET","WHOLEFDS","GROC"]): return "Groceries"
-    if any(x in u for x in ["QUIKTRIP","SHELL","EXXON","FUEL","GAS"]): return "Gas"
-    if any(x in u for x in ["J. JILL","DSW","KOHL","MARSHALLS","REI","ANTHROPOLOGIE","BEDBATH"]): return "Shopping"
-    if any(x in u for x in ["DELI","PANERA","FISH AND FIZZ","CAFETERI","SCOTTY P","BREAD ZEPPELIN","MCAF","JASON'S","CAFE"]): return "Food & drink"
-    if any(x in u for x in ["NETFLIX","MUSEUM","ARBOR"]): return "Entertainment"
+
+    # Checks
+    if u.startswith("CHECK #"):
+        return "Checks"
+
+    # --- SUBSCRIPTIONS (Netflix, Frontier, etc.) ---
+    # You asked specifically: move Netflix and Frontier to Subscriptions.
+    if "NETFLIX" in u:
+        return "Subscriptions"
+    if "FRONTIER" in u and any(k in u for k in ["COMM", "COMMUNICATION", "FIBER", "INTERNET"]):
+        return "Subscriptions"
+    if any(k in u for k in [
+        "APPLE.COM/BILL", "ICLOUD STORAGE", "APPLE MUSIC",
+        "NYTIMES", "NEW YORK TIMES",
+        "SPOTIFY", "AMZNPRIME", "AMAZON PRIME"
+    ]):
+        return "Subscriptions"
+
+    # --- GROCERIES ---
+    if any(x in u for x in [
+        "KROGER", "TRADER JOE", "TOM THUMB",
+        "CENTRAL MARKET", "MARKET STREET", "WHOLEFDS", " GROCERY"
+    ]):
+        return "Groceries"
+    if ("WAL-MART" in u or "WALMART" in u) and any(k in u for k in ["NEIGHBORHOOD", "SUPERCENTER", "GROCERY"]):
+        return "Groceries"
+
+    # --- GAS & AUTO FUEL ---
+    if any(x in u for x in [
+        "QUIKTRIP", "QT ", "SHELL", "EXXON", "FUEL", " GAS",
+        "RACETRAC", "RACE TRAC", "BUC-EE", "BUC EE"
+    ]):
+        return "Gas & Auto Fuel"
+
+    # --- DINING ---
+    if u.startswith("TST*"):
+        return "Dining"
+    if any(x in u for x in [
+        "DELI", "PANERA", "FISH AND FIZZ", "CAFETERI",
+        "SCOTTY P", "BREAD ZEPPELIN", "MCAF",
+        "JASON'S", "CAFE", "LA MADELEINE", "AFRAH",
+        "CHIPOTLE", "SUBWAY", "STARBUCKS"
+    ]):
+        return "Dining"
+
+    # --- UTILITIES (non-Frontier internet/phone, water, gas, electric) ---
+    if any(x in u for x in [
+        "CITY OF PLANO", "ATMOS", "TXU", "ONCOR",
+        "RELIANT", "GREEN MOUNTAIN", "GEXA"
+    ]):
+        return "Utilities"
+
+    # --- INSURANCE ---
+    if any(x in u for x in [
+        "ALLSTATE", "NORTHWESTERN MUTUAL ISA",
+        "UNITEDHEALTHONE INS", "AETNA", "BLUE CROSS", "BCBS"
+    ]):
+        return "Insurance"
+
+    # --- MEDICAL / PHARMACY / HEALTH & WELLNESS ---
+    if any(x in u for x in ["WALGREENS", "CVS PHARMACY", "CVS/PHARM", " PHARMACY"]):
+        return "Pharmacy"
+    if any(x in u for x in [
+        "CLINIC", "HOSPITAL", "RADIOLOGY", "LAB ",
+        "ORTHOPEDIC", "CARDIOLOGY", "IMAGING"
+    ]):
+        return "Medical"
+    if any(x in u for x in ["WELLCARE", "CHIROPRACT", "ORANGETHEORY", "ORANGE THEORY", "FITNESS", "YMCA"]):
+        return "Health & Wellness"
+
+    # --- SHOPPING: CLOTHING vs GENERAL RETAIL ---
+    if any(x in u for x in ["J. JILL", "J.JILL", "DSW", "REI", "ANTHROPOLOGIE", "NORDSTROM", "DILLARD'S"]):
+        return "Shopping - Clothing"
+    if any(x in u for x in ["MARSHALLS", "HOMEGOODS", "HOME GOODS", "BEDBATH", "BED BATH", "TARGET", "AMAZON"]):
+        return "Shopping - General Retail"
+    # Walmart non-grocery fallthrough
+    if "WAL-MART" in u or "WALMART" in u:
+        return "Shopping - General Retail"
+
+    # --- HOME IMPROVEMENT / MAINTENANCE ---
+    if "HOME DEPOT" in u or "LOWES" in u or "LOWE'S" in u:
+        return "Home Improvement / Home Maintenance"
+
+    # --- ENTERTAINMENT ---
+    if any(x in u for x in ["MUSEUM", "ARBOR", " CINEMA", " THEATRE", " THEATER"]):
+        return "Entertainment"
+
+    # --- DONATIONS ---
+    if "KERA" in u or "CHARITY" in u or "FOUNDATION" in u:
+        return "Donations"
+
+    # --- TRAVEL ---
+    if any(x in u for x in ["MARRIOTT", "HYATT", "HAMPTON INN", "HOLIDAY INN", "AIRBNB"]):
+        return "Travel - Lodging"
+    if any(x in u for x in [
+        "AMERICAN AIR", "SOUTHWEST AIR", "DELTA AIR", "UNITED AIR",
+        " LYFT", " UBER", "TOLLWAY", "N TTA", "NTTA"
+    ]):
+        return "Travel - Transportation"
+
+    # --- GOLF / SPORTS ---
+    if "GOLF" in u:
+        return "Golf / Sports"
+
+    # --- ONLINE PAYMENTS / BILL PAY ---
+    if "ONLINE PAYMENT" in u or "BILL PAY" in u or "AUTOMATIC PAYMENT" in u:
+        return "Online Payments / Bill Pay"
+
+    # Fallback
     return "Other"
+
 # --- Deposit subcategory mapping ---
 DEPOSIT_SUBCATS = [
-    ("Return",        [r"\bREFUND\b", r"\bRETURN\b", r"\bREVERSAL\b", r"\bADJUSTMENT\b"]),  # put first so it wins ties
-    ("Payroll",       [r"\bPAYROLL\b", r"\bDIRECT\s+DEP\b", r"\bINCOME\s+PMT\b", r"\bADP\b", r"\bOASISBATCH\b", r"\bNEW\s+YORK\s+LIFE\s+PAYROLL\b"]),
-    ("Transfer In",   [r"\bONLINE\s+TRANSFER\s+FROM\b", r"\bTRANSFER\s+FROM\b", r"\bFROM\s+SAV\b", r"\bPERSHING\b"]),
-    ("Check Deposit", [r"(?:ATM|MOBILE)?\s*CHECK\s+DEPOSIT"]),
-    ("Interest",      [r"\bINTEREST\s+PAYMENT\b"]),
+    # Put Refund / Return first so it wins ties
+    ("Refund / Return", [
+        r"\bREFUND\b",
+        r"\bRETURN\b",
+        r"\bREVERSAL\b",
+        r"\bADJUSTMENT\b",
+    ]),
+    ("Payroll", [
+        r"\bPAYROLL\b",
+        r"\bDIRECT\s+DEP\b",
+        r"\bINCOME\s+PMT\b",
+        r"\bADP\b",
+        r"\bOASISBATCH\b",
+        r"\bNEW\s+YORK\s+LIFE\s+PAYROLL\b",
+    ]),
+    ("Transfer In", [
+        r"\bONLINE\s+TRANSFER\s+FROM\b",
+        r"\bTRANSFER\s+FROM\b",
+        r"\bFROM\s+SAV\b",
+        r"\bPERSHING\b",
+    ]),
+    ("Check Deposit", [
+        r"(?:ATM|MOBILE)?\s*CHECK\s+DEPOSIT",
+    ]),
+    ("Interest", [
+        r"\bINTEREST\s+PAYMENT\b",
+    ]),
 ]
 
 def categorize_deposit(desc: str) -> str:
@@ -627,24 +747,77 @@ def categorize_deposit(desc: str) -> str:
         for pat in patterns:
             if re.search(pat, u):
                 return name
-    return "Deposit"  # fallback
+    # Anything that doesn't match a specific pattern becomes a generic deposit bucket
+    return "Deposit (Other)"
 
 def apply_rules(description: str, rules):
-    if not rules: return None
+    """
+    Apply category rules with precedence:
+      1) "Specific" merchant rules (Atmos, City of Plano, Sprouts, etc.)
+      2) More generic transaction-type rules (ONLINE PAYMENT, TRANSFER TO, WITHDRAWAL, etc.)
+    This ensures that:
+      - '11/21 Online Payment ... To Atmos Energy' → Utilities
+      - '11/15 Online Payment ... To City of Plano' → Utilities
+      - while still allowing generic rules for things like credit card payments.
+    """
+    if not rules:
+        return None
+
     text_cs = description or ""
     text_uc = text_cs.upper()
-    for rule in rules:
-        kw = rule["keyword"]
-        hay = text_cs if rule["case_sensitive"] else text_uc
-        needle = kw if rule["case_sensitive"] else kw.upper()
-        mt = rule["match_type"]
-        try:
-            if mt == "contains" and needle in hay: return rule["category"]
-            if mt == "startswith" and hay.startswith(needle): return rule["category"]
-            if mt == "regex" and re.search(kw, text_cs): return rule["category"]
-        except Exception:
-            continue
-    return None
+
+    # Tokens that usually indicate a *generic* rule about transaction type,
+    # not a specific merchant.
+    GENERIC_TOKENS = (
+        "ONLINE PAYMENT",
+        "PAYMENT",
+        "TRANSFER TO",
+        "TRANSFER FROM",
+        "ACH DEBIT",
+        "WITHDRAWAL",
+        "DEBIT CARD",
+        "CARD PURCHASE",
+        "POS PURCHASE",
+        "BILL PAY",
+    )
+
+    def _is_generic(rule_kw: str) -> bool:
+        kw_uc = (rule_kw or "").upper()
+        return any(tok in kw_uc for tok in GENERIC_TOKENS)
+
+    # Split rules into "specific" vs "generic"
+    specific_rules = [r for r in rules if not _is_generic(r.get("keyword", ""))]
+    generic_rules  = [r for r in rules if _is_generic(r.get("keyword", ""))]
+
+    def _match_from(ruleset):
+        for rule in ruleset:
+            kw = rule.get("keyword", "")
+            mt = str(rule.get("match_type", "contains")).lower()
+            case_sensitive = bool(rule.get("case_sensitive", False))
+
+            hay = text_cs if case_sensitive else text_uc
+            needle = kw if case_sensitive else kw.upper()
+
+            try:
+                if mt == "contains" and needle in hay:
+                    return rule.get("category") or "Other"
+                if mt == "startswith" and hay.startswith(needle):
+                    return rule.get("category") or "Other"
+                if mt == "regex" and re.search(kw, text_cs):
+                    return rule.get("category") or "Other"
+            except Exception:
+                # Bad regex or other issue: skip this rule
+                continue
+        return None
+
+    # 1) Try merchant-specific rules first
+    cat = _match_from(specific_rules)
+    if cat:
+        return cat
+
+    # 2) Fall back to generic transaction-type rules
+    return _match_from(generic_rules)
+
 
 def _norm_marker(name: str) -> str:
     s = (name or "").lower().strip()
@@ -1566,22 +1739,24 @@ def main():
         wb.save(dashboard_path) 
         return
 
-    # ---------------- CATEGORIZE ----------------
+# ---------------- CATEGORIZE ----------------
     rules = load_rules(rules_path) if rules_path else []
     df["Category"] = ""
     is_dep = df["_src"].eq("DEP_ADD")
 
-    # Deposits sub-buckets
+    # Deposits sub-buckets (always handled by deposit logic, not rules)
     df.loc[is_dep, "Category"] = df.loc[is_dep, "Description"].map(categorize_deposit)
 
     # Non-deposits via rules/defaults
     mask_rest = ~is_dep
     fill_mask = mask_rest & (df["Category"].astype(str) == "")
-    df.loc[mask_rest, "Category"] = [
-        (apply_rules(desc, rules) or categorize_default(desc))
-        for desc in df.loc[fill_mask, "Description"].astype(str)
-    ]
 
+    # Apply rules first, then fall back to categorize_default
+    for idx, desc in df.loc[fill_mask, "Description"].astype(str).items():
+        cat = apply_rules(desc, rules)
+        if not cat:
+            cat = categorize_default(desc)
+        df.at[idx, "Category"] = cat
     # Section defaults if still blank
     df.loc[df["_src"].eq("ATM")    & (df["Category"] == ""), "Category"] = "Card/ATM"
     df.loc[df["_src"].eq("ELEC")   & (df["Category"] == ""), "Category"] = "Electronic"
@@ -1609,35 +1784,84 @@ def main():
             df.loc[unknown & neg_mask, "Amount"] = -df.loc[unknown & neg_mask, "Amount"].abs()
             df.loc[unknown & pos_mask, "Amount"] = df.loc[unknown & pos_mask, "Amount"].abs()
     # === Category normalization (put near the end of parse, before writing to Excel) ===
+    # === Category normalization (put near the end of parse, before writing to Excel) ===
     CANON = {
-        "food & drink": "Food & Drink",
-        "food/drink": "Food & Drink",
+        # --- Core spending categories ---
+        "dining": "Dining",
+        "food & drink": "Dining",
+        "food and drink": "Dining",
+
         "groceries": "Groceries",
-        "gas": "Gas",
+
+        "gas": "Gas & Auto Fuel",
+        "gas & auto fuel": "Gas & Auto Fuel",
+
         "utilities": "Utilities",
+        "utility": "Utilities",
+
         "insurance": "Insurance",
+
+        "medical": "Medical",
+        "pharmacy": "Pharmacy",
         "health": "Health & Wellness",
         "health & wellness": "Health & Wellness",
-        "shopping": "Shopping",
+
+        "shopping": "Shopping - General Retail",
+        "shopping - general retail": "Shopping - General Retail",
+        "shopping – general retail": "Shopping - General Retail",
+        "shopping - clothing": "Shopping - Clothing",
+        "shopping – clothing": "Shopping - Clothing",
+
+        "home repair": "Home Improvement / Home Maintenance",
+        "home improvement": "Home Improvement / Home Maintenance",
+        "home improvement / home maintenance": "Home Improvement / Home Maintenance",
+
+        "household services": "Household Services",
+
         "entertainment": "Entertainment",
+        "subscriptions": "Subscriptions",
+        "subscription": "Subscriptions",
+
+        "donations": "Donations",
+
+        "travel": "Travel - Transportation",
+        "travel - lodging": "Travel - Lodging",
+        "travel – lodging": "Travel - Lodging",
+        "travel - transportation": "Travel - Transportation",
+        "travel – transportation": "Travel - Transportation",
+
+        "fees": "Fees",
+        "checks": "Checks",
+        "online payments / bill pay": "Online Payments / Bill Pay",
+        "online payment": "Online Payments / Bill Pay",
+        "online payments": "Online Payments / Bill Pay",
+
         "golf": "Golf / Sports",
         "golf / sports": "Golf / Sports",
-        "transportation": "Transportation",
-        "donations": "Donations",
+
+        # --- Income / transfers / deposits ---
         "refund / return": "Refund / Return",
+        "return": "Refund / Return",
+
         "deposit (other)": "Deposit (Other)",
+        "deposit": "Deposit (Other)",
+
         "transfer in": "Transfer In",
         "transfer out": "Transfer Out",
+
         "interest": "Interest",
         "income": "Income",
-        "checks": "Checks",
+        "payroll": "Payroll",
+
+        # --- Technical / fallback buckets ---
         "card/atm": "Card/ATM",
         "electronic": "Electronic",
         "other": "Other",
     }
 
     def _canonize(cat: str) -> str:
-        if not isinstance(cat, str): return "Other"
+        if not isinstance(cat, str):
+            return "Other"
         key = cat.strip().lower()
         return CANON.get(key, cat.strip().title())
 
@@ -1650,7 +1874,7 @@ def main():
     # === Guardrail: alert if "Other" is large ===
     other_sum = df.loc[df["Category"]=="Other","Amount"].sum()
     total_spend = df.loc[df["Amount"]<0,"Amount"].abs().sum()
-    if abs(other_sum) > 5000 or (total_spend and abs(other_sum)/total_spend > 0.10):
+    if abs(other_sum) > 5000 or (total_spend and abs(other_sum)/total_spend > 0.15):
         print(f"[WARN] 'Other' unusually large: {other_sum:+.2f} "
             f"({(abs(other_sum)/total_spend*100):.1f}% of spending)")
 
@@ -1879,7 +2103,12 @@ def main():
             recon_df = recon_df[keep_mask]
 
         # Append and sort
-        recon_df = pd.concat([recon_df, row_df], ignore_index=True)
+        if recon_df.empty:
+            # First row for this sheet: just use row_df
+            recon_df = row_df.copy()
+        else:
+            recon_df = pd.concat([recon_df, row_df], ignore_index=True)
+
         recon_df["Statement End"] = pd.to_datetime(recon_df["Statement End"], errors="coerce")
         recon_df = recon_df.sort_values("Statement End").reset_index(drop=True)
 

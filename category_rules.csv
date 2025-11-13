@@ -1,102 +1,169 @@
 keyword,category,match_type,case_sensitive
-Aetna Health IN,Insurance,contains,False
-SSA TREAS,Payroll,contains,False
-PAYROLL,Payroll,contains,False
-DIRECT DEP,Payroll,contains,False
-OASISBATCH,Payroll,contains,False
-Income Pmt,Income,contains,False
-DV02DT,Income,contains,False
-DIVIDEND,Income,contains,False
-INTEREST,Interest,contains,False
-INTEREST PAYMENT,Interest,contains,False
-INT CREDIT,Interest,contains,False
-Purchase Return,Refund / Return,contains,False
-Card Purchase Return,Refund / Return,contains,False
-REFUND,Refund / Return,contains,False
-REVERSAL,Refund / Return,contains,False
-ATM Check Deposit,Deposit (Other),contains,False
-DEPOSIT,Deposit (Other),contains,False
-Online Transfer From,Transfer In,contains,False
-TRANSFER FROM,Transfer In,contains,False
-PERSHING BROKERAGE,Transfer In,contains,False
-Online Payment,Transfer Out,contains,False
-TRANSFER TO,Transfer Out,contains,False
-VENMO PAYMENT,Transfer Out,contains,False
-ZELLE TO,Transfer Out,contains,False
-ZELLE,Transfer Out,contains,False
-USAA CREDIT CARD,Transfer Out,contains,False
-PAYMENT TO,Transfer Out,contains,False
-CITY OF PLANO,Utilities,contains,False
-ATMOS,Utilities,contains,False
-RELIANT,Utilities,contains,False
-TXU,Utilities,contains,False
-ONCOR,Utilities,contains,False
-SPECTRUM,Utilities,contains,False
-AT&T,Utilities,contains,False
-COMCAST,Utilities,contains,False
-NORTHWESTERN MUTUAL,Insurance,contains,False
-Northwestern Mu isa, Insurance,contains,False
-ALLSTATE,Insurance,contains,False
-GEICO,Insurance,contains,False
-PROGRESSIVE,Insurance,contains,False
-STATE FARM,Insurance,contains,False
-UNITEDHEALTH,Insurance,contains,False
-Unitedhealthone,Insurance,contains,False
-BLUE CROSS,Insurance,contains,False
-CVS,Health & Wellness,contains,False
-WALGREENS,Health & Wellness,contains,False
-WALGREEN,Health & Wellness,contains,False
-DENTAL,Health & Wellness,contains,False
-CHIROPRACT,Health & Wellness,contains,False
-HOSPITAL,Health & Wellness,contains,False
-H-E-B,Groceries,contains,False
-HEB,Groceries,contains,False
-KROGER,Groceries,contains,False
-TOM THUMB,Groceries,contains,False
-TRADER JOE,Groceries,contains,False
-CENTRAL MARKET,Groceries,contains,False
-WHOLEFDS,Groceries,contains,False
-WHOLE FOODS,Groceries,contains,False
-ALBERTSONS,Groceries,contains,False
-COSTCO,Groceries,contains,False
-SAM'S CLUB,Groceries,contains,False
-JERSEY MIKE,Food & Drink,contains,False
-SUSHI,Food & Drink,contains,False
-PANERA,Food & Drink,contains,False
-STARBUCKS,Food & Drink,contains,False
-MCDONALD,Food & Drink,contains,False
-TACO,Food & Drink,contains,False
-SUBWAY,Food & Drink,contains,False
-CHICK-FIL-A,Food & Drink,contains,False
-CHIPOTLE,Food & Drink,contains,False
-AMAZON,Shopping,contains,False
-TARGET,Shopping,contains,False
-WALMART,Shopping,contains,False
-HOME DEPOT,Shopping,contains,False
-LOWE'S,Shopping,contains,False
-LOWES,Shopping,contains,False
-ELLIOTTS HRDWRE,Shopping,contains,False
-ELLIOTT,Shopping,contains,False
-BEST BUY,Shopping,contains,False
-SHELL,Gas,contains,False
-EXXON,Gas,contains,False
-CHEVRON,Gas,contains,False
-MOBIL,Gas,contains,False
-QT ,Gas,contains,False
-QUIKTRIP,Gas,contains,False
-TOLLWAY,Transportation,contains,False
-NTTA,Transportation,contains,False
-CHURCH,Donations,contains,False
-FOUNDATION,Donations,contains,False
-KERA,Donations,contains,False
-DONATION,Donations,contains,False
-NETFLIX,Entertainment,contains,False
-SPOTIFY,Entertainment,contains,False
-HULU,Entertainment,contains,False
-MUSEUM,Entertainment,contains,False
-MOVIE,Entertainment,contains,False
-GOLF,Golf / Sports,contains,False
-TENNIS,Golf / Sports,contains,False
-ORANGETHEORY,Golf / Sports,contains,False
-PELOTON,Golf / Sports,contains,False
-Sparrowhawk, Utilities,contains,False
+7-Eleven,Groceries,contains,FALSE
+Aetna Health IN,Insurance,contains,FALSE
+ALBERTSONS,Groceries,contains,FALSE
+ALLSTATE,Insurance,contains,FALSE
+To Allstate,Insurance,contains
+Allsup,Gas & Auto Fuel,contains,FALSE
+AMAZON,Shopping,contains,FALSE
+Angelika, Entertainment, contains, False
+AT&T,Utilities,contains,FALSE
+ATM Check Deposit,Deposit (Other),contains,FALSE
+Atmos,Utilities,contains,FALSE
+Barstow Res,Dining,contains,FALSE
+BEST BUY,Shopping,contains,FALSE
+BJ's Restaurant & Brewhouse,Dining,contains,FALSE
+BLUE CROSS,Insurance,contains,FALSE
+Bonefish Grill,Dining,contains,FALSE
+Braum,Dining,contains,FALSE
+Buc-Ees,Gas & Auto Fuel, contains, False
+Card Purchase Return,Refund / Return,contains,FALSE
+CENTRAL MARKET,Groceries,contains,FALSE
+Cheddar's Scratch Kitchen,Dining,contains,FALSE
+CHEVRON,Gas & Auto Fuel,contains,FALSE
+CHICK-FIL-A,Dining,contains,FALSE
+CHIPOTLE,Dining,contains,FALSE
+CHIROPRACT,Health & Wellness,contains,FALSE
+CHURCH,Donations,contains,FALSE
+City of Plano,Utilities,contains,FALSE
+Collin Street,Dining, containts, False
+COMCAST,Utilities,contains,FALSE
+COSTCO,Groceries,contains,FALSE
+Culver's,Dining,contains,FALSE
+CVS,Health & Wellness,contains,FALSE
+DENTAL,Health & Wellness,contains,FALSE
+DEPOSIT,Deposit (Other),contains,FALSE
+DIRECT DEP,Payroll,contains,FALSE
+DIVIDEND,Income,contains,FALSE
+DONATION,Donations,contains,FALSE
+DV02DT,Income,contains,FALSE
+ELLIOTT,Shopping,contains,FALSE
+ELLIOTTS HRDWRE,Shopping,contains,FALSE
+EXXON,Gas & Auto Fuel,contains,FALSE
+First Watch,Dining,contains,FALSE
+Fish Shack,Dining, containts, False
+Flower Child,Dining,contains,FALSE
+Flying Fish,Dining, containts, False
+Food 4 Less, Groceries,contains,FALSE
+FOUNDATION,Donations,contains,FALSE
+Frontier Communications,Subscriptions,contains,FALSE
+GEICO,Insurance,contains,FALSE
+Gelson's, Groceries,contains,FALSE
+GOLF,Golf / Sports,contains,FALSE
+Green Mountain Energy,Utilities,contains,FALSE
+Half Price, Entertainment, contains, False
+Happy Hollow Park & Zoo,Entertainment,contains,FALSE
+HEB,Groceries,contains,FALSE
+H-E-B,Groceries,contains,FALSE
+Hirsch, Groceries,contains,FALSE
+HOME DEPOT,Shopping,contains,FALSE
+HOSPITAL,Health & Wellness,contains,FALSE
+HULU,Subscriptions,contains,FALSE
+Income Pmt,Income,contains,FALSE
+In-N-Out Burger,Dining,contains,FALSE
+INT CREDIT,Interest,contains,FALSE
+INTEREST,Interest,contains,FALSE
+INTEREST PAYMENT,Interest,contains,FALSE
+Jack in the Box,Dining,contains,FALSE
+Jason's Deli,Dining,contains,FALSE
+JERSEY MIKE,Dining,contains,FALSE
+Kohls, Shopping, contains, False
+KERA,Donations,contains,FALSE
+KROGER,Groceries,contains,FALSE
+Kroger Fuel Ctr,Gas & Auto Fuel,contains,FALSE
+Lazy Dog Restaurant & Bar,Dining,contains,FALSE
+Little Greek,Dining,contains,FALSE
+LOWES,Shopping,contains,FALSE
+Marshalls, Shopping, contains, False
+Mcalister's Deli,Dining, containts, False
+McDonald,Dining,contains,FALSE
+Mcdonalds,Dining,contains,FALSE
+Mcdonald,Dining,contains,FALSE
+Medical,Health & Wellness,contains,FALSE
+MetLife,Insurance,contains,FALSE
+MGM,Entertainment,contains,FALSE
+Micro Center, Shopping, contains, False
+Microsoft,Subscriptions,contains,FALSE
+Mimi's Cafe,Dining,contains,FALSE
+MOBIL,Gas & Auto Fuel,contains,FALSE
+Modernmkt,Dining, containts, False
+MOVIE,Entertainment,contains,FALSE
+MUSEUM,Entertainment,contains,FALSE
+NETFLIX,Subscriptions,contains,FALSE
+North Haven Gardens,Shopping - General Retail,contains,FALSE
+Northwestern Mu isa, Insurance,contains,FALSE
+NORTHWESTERN MUTUAL,Insurance,contains,FALSE
+NTTA,Transportation,contains,FALSE
+OASISBATCH,Payroll,contains,FALSE
+Office Depot, Shopping, contains, False
+Olive Garden,Dining,contains,FALSE
+Oncor,Utilities,contains,FALSE
+ORANGETHEORY,Golf / Sports,contains,FALSE
+Outback Steakhouse,Dining,contains,FALSE
+P.F. Chang's,Dining,contains,FALSE
+PANERA,Dining,contains,FALSE
+Pavilions, Groceries,contains,FALSE
+PELOTON,Golf / Sports,contains,FALSE
+PERSHING BROKERAGE,Transfer In,contains,FALSE
+PotBelly,Dining, containts, False
+PROGRESSIVE,Insurance,contains,FALSE
+Purchase Return,Refund / Return,contains,FALSE
+QT ,Gas & Auto Fuel,contains,FALSE
+QUIKTRIP,Gas & Auto Fuel,contains,FALSE
+RaceTrac,Gas & Auto Fuel, contians, False
+Raley's, Groceries,contains,FALSE
+Red Lobster,Dining,contains,FALSE
+REFUND,Refund / Return,contains,FALSE
+Reliant,Utilities,contains,FALSE
+REVERSAL,Refund / Return,contains,FALSE
+Safeway, Groceries,contains,FALSE
+SAM'S CLUB,Groceries,contains,FALSE
+Schlotzsky's,Dining,contains,FALSE
+Seasons 52,Di,,
+SHELL,Gas & Auto Fuel,contains,FALSE
+Sparrowhawk,Utilities,contains,FALSE
+SPECTRUM,Subscriptions,contains,FALSE
+SPOTIFY,Subscriptions,contains,FALSE
+Sprouts, Groceries, contains, False
+Sprouts Farmers Mkt,Groceries,contains,FALSE
+STARBUCKS,Dining,contains,FALSE
+STATE FARM,Insurance,contains,FALSE
+Stater Bros, Groceries,contains,FALSE
+SUBWAY,Dining,contains,FALSE
+SUSHI,Dining,contains,FALSE
+TACO,Dining,contains,FALSE
+TARGET,Shopping,contains,FALSE
+TENNIS,Golf / Sports,contains,FALSE
+Texas Roadhouse,Dining,contains,FALSE
+The Cheesecake Factory,Dining,contains,FALSE
+The Habit Burger Grill,Dining,contains,FALSE
+The UPS Store,Shipping,contains,FALSE
+TOLLWAY,Transportation,contains,FALSE
+TOM THUMB,Groceries,contains,FALSE
+Total Wine And More,Groceries,contains,FALSE
+TRADER JOE,Groceries,contains,FALSE
+Tuesday Morning, Shopping, contains, False
+TXU,Utilities,contains,FALSE
+UNITEDHEALTH,Insurance,contains,FALSE
+Unitedhealthone,Insurance,contains,FALSE
+USAA CREDIT CARD,Transfer Out,contains,FALSE
+VENMO PAYMENT,Transfer Out,contains,FALSE
+Vons, Groceries,contains,FALSE
+WALGREEN,Health & Wellness,contains,FALSE
+WALMART,Shopping,contains,FALSE
+Wendy's,Dining,contains,FALSE
+Whataburger,Dining, containts, False
+WHOLE FOODS,Groceries,contains,FALSE
+WHOLEFDS,Groceries,contains,FALSE
+WinCo, Groceries,contains,FALSE
+Yard House,Dining,contains,FALSE
+Zhangs Kitchen
+ZELLE,Transfer Out,contains,FALSE
+ZELLE TO,Transfer Out,contains,FALSE
+Online Payment,Transfer Out,contains,FALSE
+Online Transfer From,Transfer In,contains,FALSE
+PAYMENT TO,Transfer Out,contains,FALSE
+PAYROLL,Payroll,contains,FALSE
+SSA TREAS,Payroll,contains,FALSE
+TRANSFER FROM,Transfer In,contains,FALSE
+TRANSFER TO,Transfer Out,contains,FALSE
